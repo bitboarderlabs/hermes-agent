@@ -398,6 +398,7 @@ class AIAgent:
         thinking_callback: callable = None,
         reasoning_callback: callable = None,
         clarify_callback: callable = None,
+        botparlor_callback: callable = None,
         step_callback: callable = None,
         stream_delta_callback: callable = None,
         max_tokens: int = None,
@@ -514,6 +515,7 @@ class AIAgent:
         self.thinking_callback = thinking_callback
         self.reasoning_callback = reasoning_callback
         self.clarify_callback = clarify_callback
+        self.botparlor_callback = botparlor_callback
         self.step_callback = step_callback
         self.stream_delta_callback = stream_delta_callback
         self._last_reported_tool = None  # Track for "new tool" mode
@@ -4366,6 +4368,16 @@ class AIAgent:
                 choices=function_args.get("choices"),
                 callback=self.clarify_callback,
             )
+        elif function_name in ("list_moods", "set_mood", "display_media", "take_photo", "get_location"):
+            from tools.botparlor_tools import list_moods_tool, set_mood_tool, display_media_tool, take_photo_tool, get_location_tool
+            _bp_handlers = {
+                "list_moods": list_moods_tool,
+                "set_mood": set_mood_tool,
+                "display_media": display_media_tool,
+                "take_photo": take_photo_tool,
+                "get_location": get_location_tool,
+            }
+            return _bp_handlers[function_name](function_args, callback=self.botparlor_callback)
         elif function_name == "delegate_task":
             from tools.delegate_tool import delegate_task as _delegate_task
             return _delegate_task(
@@ -4702,6 +4714,18 @@ class AIAgent:
                 tool_duration = time.time() - tool_start_time
                 if self.quiet_mode:
                     self._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
+            elif function_name in ("set_mood", "display_media", "take_photo", "get_location"):
+                from tools.botparlor_tools import set_mood_tool, display_media_tool, take_photo_tool, get_location_tool
+                _bp_handlers = {
+                    "set_mood": set_mood_tool,
+                    "display_media": display_media_tool,
+                    "take_photo": take_photo_tool,
+                    "get_location": get_location_tool,
+                }
+                function_result = _bp_handlers[function_name](function_args, callback=self.botparlor_callback)
+                tool_duration = time.time() - tool_start_time
+                if self.quiet_mode:
+                    self._vprint(f"  {_get_cute_tool_message_impl(function_name, function_args, tool_duration, result=function_result)}")
             elif function_name == "delegate_task":
                 from tools.delegate_tool import delegate_task as _delegate_task
                 tasks_arg = function_args.get("tasks")

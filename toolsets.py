@@ -64,6 +64,8 @@ _HERMES_CORE_TOOLS = [
     "honcho_context", "honcho_profile", "honcho_search", "honcho_conclude",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+    # BotParlor client tools (avatar, media, sensors — functional when connected via gateway)
+    "list_moods", "set_mood", "display_media", "take_photo", "get_location",
 ]
 
 

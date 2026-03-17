@@ -239,6 +239,9 @@ class GatewayConfig:
             # Platforms that use token/api_key auth
             if config.token or config.api_key:
                 connected.append(platform)
+            # API Server uses enabled flag only (key is optional)
+            elif platform == Platform.API_SERVER:
+                connected.append(platform)
             # WhatsApp uses enabled flag only (bridge handles auth)
             elif platform == Platform.WHATSAPP:
                 connected.append(platform)
@@ -733,6 +736,25 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 pass
         if api_server_host:
             config.platforms[Platform.API_SERVER].extra["host"] = api_server_host
+
+    # Also check config.yaml api_server section (BotParlor customization)
+    if Platform.API_SERVER not in config.platforms or not config.platforms.get(Platform.API_SERVER, PlatformConfig()).enabled:
+        try:
+            import yaml
+            config_yaml_path = get_hermes_home() / "config.yaml"
+            if config_yaml_path.exists():
+                with open(config_yaml_path, encoding="utf-8") as f:
+                    yaml_cfg = yaml.safe_load(f) or {}
+                api_cfg = yaml_cfg.get("api_server", {})
+                if isinstance(api_cfg, dict) and api_cfg.get("enabled"):
+                    if Platform.API_SERVER not in config.platforms:
+                        config.platforms[Platform.API_SERVER] = PlatformConfig()
+                    config.platforms[Platform.API_SERVER].enabled = True
+                    key = api_cfg.get("key", "")
+                    if key:
+                        config.platforms[Platform.API_SERVER].api_key = str(key)
+        except Exception:
+            pass
 
     # Session settings
     idle_minutes = os.getenv("SESSION_IDLE_MINUTES")

@@ -1185,6 +1185,19 @@ class GatewayRunner:
 
         return None
     
+    def _get_botparlor_callback(self, source) -> "callable | None":
+        """Get BotParlor tool callback for this session, if available.
+
+        The API server adapter registers callbacks per chat_id for active
+        WebSocket sessions. This bridges BotParlor tools (set_mood,
+        display_media, take_photo, get_location) to the WebSocket client.
+        """
+        adapter = self.adapters.get(Platform.API_SERVER)
+        if adapter and hasattr(adapter, 'get_botparlor_callback'):
+            return adapter.get_botparlor_callback(source.chat_id)
+        return None
+        return None
+
     def _is_user_authorized(self, source: SessionSource) -> bool:
         """
         Check if a user is authorized to use the bot.
@@ -1200,6 +1213,11 @@ class GatewayRunner:
         # user-initiated messages.  The HASS_TOKEN already authenticates the
         # connection, so HA events are always authorized.
         if source.platform == Platform.HOMEASSISTANT:
+            return True
+
+        # API Server authenticates via Bearer token at the HTTP layer,
+        # so all requests that reach the handler are pre-authorized.
+        if source.platform == Platform.API_SERVER:
             return True
 
         user_id = source.user_id
@@ -2152,6 +2170,19 @@ class GatewayRunner:
                 provider=agent_result.get("provider"),
                 base_url=agent_result.get("base_url"),
             )
+
+            # Store structured result for API server adapter to consume.
+            # This makes tool calls, reasoning, and metadata available to
+            # the WebSocket adapter without modifying the return type.
+            adapter = self.adapters.get(Platform.API_SERVER)
+            if adapter and hasattr(adapter, '_store_agent_result'):
+                adapter._store_agent_result(source.chat_id, {
+                    "messages": new_messages,
+                    "last_reasoning": agent_result.get("last_reasoning"),
+                    "model": agent_result.get("model"),
+                    "api_calls": agent_result.get("api_calls", 0),
+                    "last_prompt_tokens": agent_result.get("last_prompt_tokens", 0),
+                })
 
             # Auto voice reply: send TTS audio before the text response
             if self._should_send_voice_reply(event, response, agent_messages):
@@ -3158,6 +3189,7 @@ class GatewayRunner:
                 Platform.HOMEASSISTANT: "hermes-homeassistant",
                 Platform.EMAIL: "hermes-email",
                 Platform.DINGTALK: "hermes-dingtalk",
+                Platform.API_SERVER: "hermes-cli",
             }
             platform_toolsets_config = {}
             try:
@@ -3180,6 +3212,7 @@ class GatewayRunner:
                 Platform.HOMEASSISTANT: "homeassistant",
                 Platform.EMAIL: "email",
                 Platform.DINGTALK: "dingtalk",
+                Platform.API_SERVER: "api_server",
             }.get(source.platform, "telegram")
 
             config_toolsets = platform_toolsets_config.get(platform_config_key)
@@ -4265,6 +4298,7 @@ class GatewayRunner:
             Platform.HOMEASSISTANT: "hermes-homeassistant",
             Platform.EMAIL: "hermes-email",
             Platform.DINGTALK: "hermes-dingtalk",
+            Platform.API_SERVER: "hermes-cli",
         }
 
         # Try to load platform_toolsets from config
@@ -4290,6 +4324,7 @@ class GatewayRunner:
             Platform.HOMEASSISTANT: "homeassistant",
             Platform.EMAIL: "email",
             Platform.DINGTALK: "dingtalk",
+            Platform.API_SERVER: "api_server",
         }.get(source.platform, "telegram")
         
         # Use config override if present (list of toolsets), otherwise hardcoded default
@@ -4583,8 +4618,9 @@ class GatewayRunner:
                 honcho_config=honcho_config,
                 session_db=self._session_db,
                 fallback_model=self._fallback_model,
+                botparlor_callback=self._get_botparlor_callback(source),
             )
-            
+
             # Store agent reference for interrupt support
             agent_holder[0] = agent
             # Capture the full tool definitions for transcript logging
