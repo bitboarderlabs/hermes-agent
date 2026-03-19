@@ -548,7 +548,13 @@ class AIAgent:
         self.config = load_config()
         
         # Debug: Log identity_file setting
-        logger.info(f"AIAgent: identity_file = {self.config.get('identity_file')}")
+        identity_file_path = self.config.get('identity_file')
+        logger.info(f"AIAgent: identity_file = {identity_file_path}")
+        
+        # Also verify what load_agent_identity would return
+        from agent.prompt_builder import load_agent_identity
+        test_identity = load_agent_identity(self.config)
+        logger.info(f"AIAgent: loaded identity first 100 chars = {test_identity[:100]}...")
         
         # Model response configuration
         self.max_tokens = max_tokens  # None = use model default
