@@ -110,6 +110,7 @@ def ensure_hermes_home():
 
 DEFAULT_CONFIG = {
     "model": "anthropic/claude-opus-4.6",
+    "identity_file": "",  # Path to external identity file (relative to HERMES_HOME or absolute)
     "toolsets": ["hermes-cli"],
     "agent": {
         "max_turns": 90,

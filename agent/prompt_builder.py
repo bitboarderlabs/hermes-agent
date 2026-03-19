@@ -125,6 +125,48 @@ DEFAULT_AGENT_IDENTITY = (
     "Be targeted and efficient in your exploration and investigations."
 )
 
+
+def load_agent_identity(config: Optional[dict] = None) -> str:
+    """Load agent identity from external file if configured, otherwise return default.
+    
+    Checks in order:
+    1. HERMES_IDENTITY_FILE env var (overrides everything)
+    2. config["identity_file"] if set
+    3. Falls back to DEFAULT_AGENT_IDENTITY
+    
+    Args:
+        config: Agent configuration dict (optional)
+    
+    Returns:
+        The agent identity string to use as the base of the system prompt.
+    """
+    # Check env var first (highest priority)
+    identity_file = os.getenv("HERMES_IDENTITY_FILE")
+    
+    # Then check config
+    if not identity_file and config:
+        identity_file = config.get("identity_file", "")
+    
+    if identity_file:
+        file_path = Path(identity_file)
+        if not file_path.is_absolute():
+            # Relative paths are resolved from HERMES_HOME
+            hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+            file_path = hermes_home / identity_file
+        
+        if file_path.exists():
+            content = file_path.read_text(encoding="utf-8").strip()
+            if content:
+                logger.debug("Loaded agent identity from: %s", file_path)
+                return content
+            else:
+                logger.warning("Identity file exists but is empty: %s", file_path)
+        else:
+            logger.warning("Identity file not found: %s", file_path)
+    
+    return DEFAULT_AGENT_IDENTITY
+
+
 MEMORY_GUIDANCE = (
     "You have persistent memory across sessions. Save durable facts using the memory "
     "tool: user preferences, environment details, tool quirks, and stable conventions. "

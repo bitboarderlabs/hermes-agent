@@ -160,6 +160,7 @@ def load_cli_config() -> Dict[str, Any]:
             "base_url": OPENROUTER_BASE_URL,
             "provider": "auto",
         },
+        "identity_file": "",  # Path to external identity file (relative to HERMES_HOME or absolute)
         "terminal": {
             "env_type": "local",
             "cwd": ".",  # "." is resolved to os.getcwd() at runtime
