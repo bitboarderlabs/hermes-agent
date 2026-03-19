@@ -543,6 +543,10 @@ class AIAgent:
         self.enabled_toolsets = enabled_toolsets
         self.disabled_toolsets = disabled_toolsets
         
+        # Load config from ~/.hermes/config.yaml for identity_file and other settings
+        from hermes_cli.config import load_config
+        self.config = load_config()
+        
         # Model response configuration
         self.max_tokens = max_tokens  # None = use model default
         self.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
