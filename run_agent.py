@@ -547,6 +547,9 @@ class AIAgent:
         from hermes_cli.config import load_config
         self.config = load_config()
         
+        # Debug: Log identity_file setting
+        logger.info(f"AIAgent: identity_file = {self.config.get('identity_file')}")
+        
         # Model response configuration
         self.max_tokens = max_tokens  # None = use model default
         self.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
