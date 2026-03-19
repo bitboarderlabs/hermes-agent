@@ -499,14 +499,18 @@ def load_soul_md() -> Optional[str]:
         return None
 
 
+
 def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = False) -> str:
     """Discover and load context files for the system prompt.
 
     Discovery: AGENTS.md (recursive), .cursorrules / .cursor/rules/*.mdc,
     and SOUL.md from HERMES_HOME only. Each capped at 20,000 chars.
 
-    When *skip_soul* is True, SOUL.md is not included here (it was already
-    loaded via ``load_soul_md()`` for the identity slot).
+    Args:
+        cwd: Working directory for AGENTS.md / .cursorrules discovery.
+        skip_soul: When True, skip loading SOUL.md.  Set automatically when
+            an identity_file is configured — the identity file replaces
+            SOUL.md as the agent's base persona.
     """
     if cwd is None:
         cwd = os.getcwd()
@@ -596,7 +600,9 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
         hermes_md_content = _truncate_content(hermes_md_content, ".hermes.md")
         sections.append(hermes_md_content)
 
-    # SOUL.md from HERMES_HOME only — skip when already loaded as identity
+    # SOUL.md from HERMES_HOME only.
+    # Skipped when an identity_file is configured — the identity file
+    # is the authoritative persona and SOUL.md would conflict with it.
     if not skip_soul:
         soul_content = load_soul_md()
         if soul_content:

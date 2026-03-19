@@ -546,16 +546,7 @@ class AIAgent:
         # Load config from ~/.hermes/config.yaml for identity_file and other settings
         from hermes_cli.config import load_config
         self.config = load_config()
-        
-        # Debug: Log identity_file setting
-        identity_file_path = self.config.get('identity_file')
-        logger.info(f"AIAgent: identity_file = {identity_file_path}")
-        
-        # Also verify what load_agent_identity would return
-        from agent.prompt_builder import load_agent_identity
-        test_identity = load_agent_identity(self.config)
-        logger.info(f"AIAgent: loaded identity first 100 chars = {test_identity[:100]}...")
-        
+
         # Model response configuration
         self.max_tokens = max_tokens  # None = use model default
         self.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
@@ -1982,16 +1973,20 @@ class AIAgent:
         is stable across all turns in a session, maximizing prefix cache hits.
         """
         # Layers (in order):
-        #   1. Agent identity — SOUL.md when available, else DEFAULT_AGENT_IDENTITY
+        #   1. Agent identity (from identity_file if configured, else default)
         #   2. User / gateway system prompt (if provided)
         #   3. Persistent memory (frozen snapshot)
         #   4. Skills guidance (if skills tools are loaded)
-        #   5. Context files (AGENTS.md, .cursorrules — SOUL.md excluded here when used as identity)
+        #   5. Context files (AGENTS.md, .cursorrules; SOUL.md only when no identity_file)
         #   6. Current date & time (frozen at build time)
         #   7. Platform-specific formatting hint
         # If an AI peer name is configured in Honcho, personalise the identity line.
-        # First, load the base identity (supports external file via config or env var)
+        # Load the base identity (supports external file via config or env var).
+        # When identity_file is set it is the authoritative persona — SOUL.md is
+        # skipped to avoid conflicting "You are X" / "You are Y" instructions.
         _identity = load_agent_identity(self.config)
+        _has_custom_identity = bool(self.config and self.config.get("identity_file"))
+
 
         # Then apply Honcho override if configured
         _ai_peer_name = (
@@ -2101,7 +2096,7 @@ class AIAgent:
             prompt_parts.append(skills_prompt)
 
         if not self.skip_context_files:
-            context_files_prompt = build_context_files_prompt(skip_soul=_soul_loaded)
+            context_files_prompt = build_context_files_prompt(skip_soul=_has_custom_identity)
             if context_files_prompt:
                 prompt_parts.append(context_files_prompt)
 
