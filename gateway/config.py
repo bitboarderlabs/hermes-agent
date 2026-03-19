@@ -749,10 +749,21 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 if isinstance(api_cfg, dict) and api_cfg.get("enabled"):
                     if Platform.API_SERVER not in config.platforms:
                         config.platforms[Platform.API_SERVER] = PlatformConfig()
-                    config.platforms[Platform.API_SERVER].enabled = True
+                    pc = config.platforms[Platform.API_SERVER]
+                    pc.enabled = True
                     key = api_cfg.get("key", "")
                     if key:
-                        config.platforms[Platform.API_SERVER].api_key = str(key)
+                        pc.api_key = str(key)
+                    # Propagate host/port so the adapter picks them up
+                    yaml_host = api_cfg.get("host")
+                    if yaml_host:
+                        pc.extra["host"] = str(yaml_host)
+                    yaml_port = api_cfg.get("port")
+                    if yaml_port:
+                        try:
+                            pc.extra["port"] = int(yaml_port)
+                        except (ValueError, TypeError):
+                            pass
         except Exception:
             pass
 
