@@ -1416,6 +1416,13 @@ class GatewayRunner:
             adapter.gateway_runner = self  # For cross-platform delivery
             return adapter
 
+        elif platform == Platform.BOTPARLOR:
+            from gateway.platforms.botparlor import BotParlorAdapter, check_botparlor_requirements
+            if not check_botparlor_requirements():
+                logger.warning("BotParlor: websockets/aiohttp not installed")
+                return None
+            return BotParlorAdapter(config)
+
         return None
     
     def _is_user_authorized(self, source: SessionSource) -> bool:
@@ -1434,7 +1441,7 @@ class GatewayRunner:
         # connection, so HA events are always authorized.
         # Webhook events are authenticated via HMAC signature validation in
         # the adapter itself — no user allowlist applies.
-        if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK):
+        if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK, Platform.BOTPARLOR):
             return True
 
         user_id = source.user_id

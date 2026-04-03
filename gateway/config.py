@@ -57,6 +57,7 @@ class Platform(Enum):
     DINGTALK = "dingtalk"
     API_SERVER = "api_server"
     WEBHOOK = "webhook"
+    BOTPARLOR = "botparlor"
 
 
 @dataclass
@@ -273,6 +274,9 @@ class GatewayConfig:
                 connected.append(platform)
             # Webhook uses enabled flag only (secrets are per-route)
             elif platform == Platform.WEBHOOK:
+                connected.append(platform)
+            # BotParlor uses enabled flag + url in extra
+            elif platform == Platform.BOTPARLOR and config.extra.get("url"):
                 connected.append(platform)
         return connected
     
@@ -518,6 +522,24 @@ def load_gateway_config() -> GatewayConfig:
                     extra = {}
                     plat_data["extra"] = extra
                 extra.update(bridged)
+
+            # BotParlor settings from config.yaml
+            bp_cfg = yaml_cfg.get("botparlor", {})
+            if isinstance(bp_cfg, dict) and bp_cfg.get("url"):
+                bp_plat = platforms_data.setdefault("botparlor", {})
+                if not isinstance(bp_plat, dict):
+                    bp_plat = {}
+                    platforms_data["botparlor"] = bp_plat
+                bp_plat["enabled"] = True
+                bp_extra = bp_plat.setdefault("extra", {})
+                if not isinstance(bp_extra, dict):
+                    bp_extra = {}
+                    bp_plat["extra"] = bp_extra
+                bp_extra["url"] = bp_cfg["url"]
+                if bp_cfg.get("bot_name"):
+                    bp_extra["bot_name"] = bp_cfg["bot_name"]
+                if bp_cfg.get("api_key"):
+                    bp_extra["api_key"] = bp_cfg["api_key"]
 
             # Discord settings → env vars (env vars take precedence)
             discord_cfg = yaml_cfg.get("discord", {})
@@ -786,6 +808,20 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 pass
         if api_server_host:
             config.platforms[Platform.API_SERVER].extra["host"] = api_server_host
+
+    # BotParlor platform
+    bp_url = os.getenv("BOTPARLOR_URL", "")
+    bp_bot_name = os.getenv("BOTPARLOR_BOT_NAME", "")
+    bp_api_key = os.getenv("BOTPARLOR_API_KEY", "")
+    if bp_url:
+        if Platform.BOTPARLOR not in config.platforms:
+            config.platforms[Platform.BOTPARLOR] = PlatformConfig()
+        config.platforms[Platform.BOTPARLOR].enabled = True
+        config.platforms[Platform.BOTPARLOR].extra["url"] = bp_url
+        if bp_bot_name:
+            config.platforms[Platform.BOTPARLOR].extra["bot_name"] = bp_bot_name
+        if bp_api_key:
+            config.platforms[Platform.BOTPARLOR].extra["api_key"] = bp_api_key
 
     # Webhook platform
     webhook_enabled = os.getenv("WEBHOOK_ENABLED", "").lower() in ("true", "1", "yes")

@@ -277,6 +277,40 @@ def build_session_context_prompt(
             "that you can only read messages sent directly to you and respond."
         )
 
+    # Group chat behavioral guidelines (any platform with group chats)
+    if context.source.chat_type == "group":
+        lines.append("")
+        lines.append("## Group Chat Behavior")
+        lines.append(
+            "You are in a group conversation with Alex and other AI participants. "
+            "Messages are labeled with [sender:Name] so you know who said what."
+        )
+        lines.append("")
+        lines.append(
+            "When a message arrives, decide whether it warrants a response from you:"
+        )
+        lines.append(
+            "- **RESPOND** if: the message is directed at you, asks you a question, "
+            "introduces new information relevant to your role, or naturally calls for "
+            "your input."
+        )
+        lines.append(
+            '- **RESPOND WITH "..."** if: the message is a simple acknowledgment, '
+            "agreement, or doesn't require your input. This signals you're listening "
+            "but have nothing to add. Just reply with exactly three dots: ..."
+        )
+        lines.append("")
+        lines.append(
+            "Be especially conservative about responding if Alex hasn't spoken "
+            "recently. The conversation should generally flow through him."
+        )
+        lines.append("")
+        lines.append(
+            '**Hard rule:** If you have sent 3 or more messages since Alex last spoke, '
+            'always respond with "..." until Alex sends another message. This prevents '
+            "runaway bot-to-bot conversations."
+        )
+
     # Connected platforms
     platforms_list = ["local (files on this machine)"]
     for p in context.connected_platforms:

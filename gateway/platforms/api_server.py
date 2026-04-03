@@ -468,7 +468,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
-        session_id = str(uuid.uuid4())
+        session_id = body.get("session_id") or str(uuid.uuid4())  # BOTPARLOR_SSE: allow client-specified session
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", "hermes-agent")
         created = int(time.time())
@@ -477,8 +477,16 @@ class APIServerAdapter(BasePlatformAdapter):
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
 
+            # ── BOTPARLOR_SSE: enriched stream queue ──
+            # NOTE: None from the agent is a mid-stream flush signal (before tool execution),
+            # NOT the end of stream.  We skip it here; the stream ends when agent_task completes.
             def _on_delta(delta):
-                _stream_q.put(delta)
+                if delta is not None:
+                    _stream_q.put(("delta", delta))
+
+            def _on_bp_event(event_type, data):
+                _stream_q.put((event_type, data))
+            # ── /BOTPARLOR_SSE ──
 
             # Start agent in background
             agent_task = asyncio.ensure_future(self._run_agent(
@@ -487,6 +495,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
+                botparlor_event_callback=_on_bp_event,  # BOTPARLOR_SSE
             ))
 
             return await self._write_sse_chat_completion(
@@ -576,35 +585,51 @@ class APIServerAdapter(BasePlatformAdapter):
         loop = asyncio.get_event_loop()
         while True:
             try:
-                delta = await loop.run_in_executor(None, lambda: stream_q.get(timeout=0.5))
+                item = await loop.run_in_executor(None, lambda: stream_q.get(timeout=0.5))  # BOTPARLOR_SSE: renamed delta→item
             except _q.Empty:
                 if agent_task.done():
-                    # Drain any remaining items
+                    # Drain any remaining items  # BOTPARLOR_SSE: structured event support
                     while True:
                         try:
-                            delta = stream_q.get_nowait()
-                            if delta is None:
+                            item = stream_q.get_nowait()
+                            if item is None:
                                 break
-                            content_chunk = {
-                                "id": completion_id, "object": "chat.completion.chunk",
-                                "created": created, "model": model,
-                                "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
-                            }
-                            await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                            # ── BOTPARLOR_SSE: dispatch on event type ──
+                            if isinstance(item, tuple):
+                                evt_type, evt_data = item
+                                if evt_type == "delta":
+                                    _c = {"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                          "choices": [{"index": 0, "delta": {"content": evt_data}, "finish_reason": None}]}
+                                    await response.write(f"data: {json.dumps(_c)}\n\n".encode())
+                                else:
+                                    await response.write(f"event: {evt_type}\ndata: {json.dumps(evt_data)}\n\n".encode())
+                            else:
+                                _c = {"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                      "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}]}
+                                await response.write(f"data: {json.dumps(_c)}\n\n".encode())
+                            # ── /BOTPARLOR_SSE ──
                         except _q.Empty:
                             break
                     break
                 continue
 
-            if delta is None:  # End of stream sentinel
+            if item is None:  # End of stream sentinel
                 break
 
-            content_chunk = {
-                "id": completion_id, "object": "chat.completion.chunk",
-                "created": created, "model": model,
-                "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
-            }
-            await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+            # ── BOTPARLOR_SSE: dispatch on event type ──
+            if isinstance(item, tuple):
+                evt_type, evt_data = item
+                if evt_type == "delta":
+                    content_chunk = {"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                    "choices": [{"index": 0, "delta": {"content": evt_data}, "finish_reason": None}]}
+                    await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                else:
+                    await response.write(f"event: {evt_type}\ndata: {json.dumps(evt_data)}\n\n".encode())
+            else:
+                content_chunk = {"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}]}
+                await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+            # ── /BOTPARLOR_SSE ──
 
         # Get usage from completed agent
         usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -613,6 +638,18 @@ class APIServerAdapter(BasePlatformAdapter):
             usage = agent_usage or usage
         except Exception:
             pass
+
+        # ── BOTPARLOR_SSE: emit turn.complete with enriched data ──
+        _bp_turn = {
+            "model": model,
+            "input_tokens": usage.get("input_tokens", 0),
+            "output_tokens": usage.get("output_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+            "cache_read_tokens": usage.get("cache_read_tokens", 0),
+            "cache_write_tokens": usage.get("cache_write_tokens", 0),
+        }
+        await response.write(f"event: turn.complete\ndata: {json.dumps(_bp_turn)}\n\n".encode())
+        # ── /BOTPARLOR_SSE ──
 
         # Finish chunk
         finish_chunk = {
@@ -714,7 +751,7 @@ class APIServerAdapter(BasePlatformAdapter):
             conversation_history = conversation_history[-100:]
 
         # Run the agent (with Idempotency-Key support)
-        session_id = str(uuid.uuid4())
+        session_id = body.get("session_id") or str(uuid.uuid4())  # BOTPARLOR_SSE: allow client-specified session
 
         async def _compute_response():
             return await self._run_agent(
@@ -1129,6 +1166,7 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        botparlor_event_callback=None,  # BOTPARLOR_SSE
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -1144,6 +1182,33 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 stream_delta_callback=stream_delta_callback,
             )
+            # ── BOTPARLOR_SSE: wire tool/thinking callbacks ──
+            if botparlor_event_callback:
+                _orig_progress = agent.tool_progress_callback
+                def _bp_tool_start(name, preview, args):
+                    try:
+                        botparlor_event_callback("tool.start", {"name": name, "preview": preview or "", "args": args or {}})
+                    except Exception:
+                        pass
+                    if _orig_progress:
+                        _orig_progress(name, preview, args)
+                agent.tool_progress_callback = _bp_tool_start
+
+                def _bp_thinking(text):
+                    if text:
+                        try:
+                            botparlor_event_callback("thinking", {"text": text})
+                        except Exception:
+                            pass
+                agent.thinking_callback = _bp_thinking
+
+                def _bp_tool_complete(name, duration, success):
+                    try:
+                        botparlor_event_callback("tool.complete", {"name": name, "duration": round(duration, 2), "success": success})
+                    except Exception:
+                        pass
+                agent.tool_result_callback = _bp_tool_complete
+            # ── /BOTPARLOR_SSE ──
             result = agent.run_conversation(
                 user_message=user_message,
                 conversation_history=conversation_history,
@@ -1152,6 +1217,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                 "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
                 "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                "cache_read_tokens": getattr(agent, "session_cache_read_tokens", 0) or 0,  # BOTPARLOR_SSE
+                "cache_write_tokens": getattr(agent, "session_cache_write_tokens", 0) or 0,  # BOTPARLOR_SSE
             }
             return result, usage
 

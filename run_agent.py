@@ -4840,6 +4840,18 @@ class AIAgent:
                 total_dur = sum(r[3] for r in results if r is not None)
                 spinner.stop(f"⚡ {completed}/{num_tools} tools completed in {total_dur:.1f}s total")
 
+        # ── BOTPARLOR_SSE: fire tool_result_callback ──
+        _bp_tool_cb = getattr(self, "tool_result_callback", None)
+        if _bp_tool_cb:
+            for r in results:
+                if r is not None:
+                    _fn, _fa, _fr, _dur, _err = r
+                    try:
+                        _bp_tool_cb(_fn, _dur, not _err)
+                    except Exception:
+                        pass
+        # ── /BOTPARLOR_SSE ──
+
         # ── Post-execution: display per-tool results ─────────────────────
         for i, (tc, name, args) in enumerate(parsed_calls):
             r = results[i]
