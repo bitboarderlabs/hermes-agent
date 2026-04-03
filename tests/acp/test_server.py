@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, AsyncMock, patch
 import pytest
 
 import acp
+from acp.agent.router import build_agent_router
 from acp.schema import (
     AgentCapabilities,
     AuthenticateResponse,
@@ -18,6 +19,8 @@ from acp.schema import (
     NewSessionResponse,
     PromptResponse,
     ResumeSessionResponse,
+    SetSessionConfigOptionResponse,
+    SetSessionModeResponse,
     SessionInfo,
     TextContentBlock,
     Usage,
@@ -166,6 +169,74 @@ class TestListAndFork:
         fork_resp = await agent.fork_session(cwd="/forked", session_id=new_resp.session_id)
         assert fork_resp.session_id
         assert fork_resp.session_id != new_resp.session_id
+
+
+# ---------------------------------------------------------------------------
+# session configuration / model routing
+# ---------------------------------------------------------------------------
+
+
+class TestSessionConfiguration:
+    @pytest.mark.asyncio
+    async def test_set_session_mode_returns_response(self, agent):
+        new_resp = await agent.new_session(cwd="/tmp")
+        resp = await agent.set_session_mode(mode_id="chat", session_id=new_resp.session_id)
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        assert isinstance(resp, SetSessionModeResponse)
+        assert getattr(state, "mode", None) == "chat"
+
+    @pytest.mark.asyncio
+    async def test_set_config_option_returns_response(self, agent):
+        new_resp = await agent.new_session(cwd="/tmp")
+        resp = await agent.set_config_option(
+            config_id="approval_mode",
+            session_id=new_resp.session_id,
+            value="auto",
+        )
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        assert isinstance(resp, SetSessionConfigOptionResponse)
+        assert getattr(state, "config_options", {}) == {"approval_mode": "auto"}
+        assert resp.config_options == []
+
+    @pytest.mark.asyncio
+    async def test_router_accepts_stable_session_config_methods(self, agent):
+        new_resp = await agent.new_session(cwd="/tmp")
+        router = build_agent_router(agent)
+
+        mode_result = await router(
+            "session/set_mode",
+            {"modeId": "chat", "sessionId": new_resp.session_id},
+            False,
+        )
+        config_result = await router(
+            "session/set_config_option",
+            {
+                "configId": "approval_mode",
+                "sessionId": new_resp.session_id,
+                "value": "auto",
+            },
+            False,
+        )
+
+        assert mode_result == {}
+        assert config_result == {"configOptions": []}
+
+    @pytest.mark.asyncio
+    async def test_router_accepts_unstable_model_switch_when_enabled(self, agent):
+        new_resp = await agent.new_session(cwd="/tmp")
+        router = build_agent_router(agent, use_unstable_protocol=True)
+
+        result = await router(
+            "session/set_model",
+            {"modelId": "gpt-5.4", "sessionId": new_resp.session_id},
+            False,
+        )
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        assert result == {}
+        assert state.model == "gpt-5.4"
 
 
 # ---------------------------------------------------------------------------
@@ -434,3 +505,179 @@ class TestSlashCommands:
         assert state.agent.provider == "anthropic"
         assert state.agent.base_url == "https://anthropic.example/v1"
         assert runtime_calls[-1] == "anthropic"
+
+
+# ---------------------------------------------------------------------------
+# _register_session_mcp_servers
+# ---------------------------------------------------------------------------
+
+
+class TestRegisterSessionMcpServers:
+    """Tests for ACP MCP server registration in session lifecycle."""
+
+    @pytest.mark.asyncio
+    async def test_noop_when_no_servers(self, agent, mock_manager):
+        """No-op when mcp_servers is None or empty."""
+        state = mock_manager.create_session(cwd="/tmp")
+        # Should not raise
+        await agent._register_session_mcp_servers(state, None)
+        await agent._register_session_mcp_servers(state, [])
+
+    @pytest.mark.asyncio
+    async def test_registers_stdio_servers(self, agent, mock_manager):
+        """McpServerStdio servers are converted and passed to register_mcp_servers."""
+        from acp.schema import McpServerStdio, EnvVariable
+
+        state = mock_manager.create_session(cwd="/tmp")
+        # Give the mock agent the attributes _register_session_mcp_servers reads
+        state.agent.enabled_toolsets = ["hermes-acp"]
+        state.agent.disabled_toolsets = None
+        state.agent.tools = []
+        state.agent.valid_tool_names = set()
+
+        server = McpServerStdio(
+            name="test-server",
+            command="/usr/bin/test",
+            args=["--flag"],
+            env=[EnvVariable(name="KEY", value="val")],
+        )
+
+        registered_config = {}
+        def capture_register(config_map):
+            registered_config.update(config_map)
+            return ["mcp_test_server_tool1"]
+
+        with patch("tools.mcp_tool.register_mcp_servers", side_effect=capture_register), \
+             patch("model_tools.get_tool_definitions", return_value=[]):
+            await agent._register_session_mcp_servers(state, [server])
+
+        assert "test-server" in registered_config
+        cfg = registered_config["test-server"]
+        assert cfg["command"] == "/usr/bin/test"
+        assert cfg["args"] == ["--flag"]
+        assert cfg["env"] == {"KEY": "val"}
+
+    @pytest.mark.asyncio
+    async def test_registers_http_servers(self, agent, mock_manager):
+        """McpServerHttp servers are converted correctly."""
+        from acp.schema import McpServerHttp, HttpHeader
+
+        state = mock_manager.create_session(cwd="/tmp")
+        state.agent.enabled_toolsets = ["hermes-acp"]
+        state.agent.disabled_toolsets = None
+        state.agent.tools = []
+        state.agent.valid_tool_names = set()
+
+        server = McpServerHttp(
+            name="http-server",
+            url="https://api.example.com/mcp",
+            headers=[HttpHeader(name="Authorization", value="Bearer tok")],
+        )
+
+        registered_config = {}
+        def capture_register(config_map):
+            registered_config.update(config_map)
+            return []
+
+        with patch("tools.mcp_tool.register_mcp_servers", side_effect=capture_register), \
+             patch("model_tools.get_tool_definitions", return_value=[]):
+            await agent._register_session_mcp_servers(state, [server])
+
+        assert "http-server" in registered_config
+        cfg = registered_config["http-server"]
+        assert cfg["url"] == "https://api.example.com/mcp"
+        assert cfg["headers"] == {"Authorization": "Bearer tok"}
+
+    @pytest.mark.asyncio
+    async def test_refreshes_agent_tool_surface(self, agent, mock_manager):
+        """After MCP registration, agent.tools and valid_tool_names are refreshed."""
+        from acp.schema import McpServerStdio
+
+        state = mock_manager.create_session(cwd="/tmp")
+        state.agent.enabled_toolsets = ["hermes-acp"]
+        state.agent.disabled_toolsets = None
+        state.agent.tools = []
+        state.agent.valid_tool_names = set()
+        state.agent._cached_system_prompt = "old prompt"
+
+        server = McpServerStdio(
+            name="srv",
+            command="/bin/test",
+            args=[],
+            env=[],
+        )
+
+        fake_tools = [
+            {"function": {"name": "mcp_srv_search"}},
+            {"function": {"name": "terminal"}},
+        ]
+
+        with patch("tools.mcp_tool.register_mcp_servers", return_value=["mcp_srv_search"]), \
+             patch("model_tools.get_tool_definitions", return_value=fake_tools):
+            await agent._register_session_mcp_servers(state, [server])
+
+        assert state.agent.tools == fake_tools
+        assert state.agent.valid_tool_names == {"mcp_srv_search", "terminal"}
+        # _invalidate_system_prompt should have been called
+        state.agent._invalidate_system_prompt.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_register_failure_logs_warning(self, agent, mock_manager):
+        """If register_mcp_servers raises, warning is logged but no crash."""
+        from acp.schema import McpServerStdio
+
+        state = mock_manager.create_session(cwd="/tmp")
+        server = McpServerStdio(
+            name="bad",
+            command="/nonexistent",
+            args=[],
+            env=[],
+        )
+
+        with patch("tools.mcp_tool.register_mcp_servers", side_effect=RuntimeError("boom")):
+            # Should not raise
+            await agent._register_session_mcp_servers(state, [server])
+
+    @pytest.mark.asyncio
+    async def test_new_session_calls_register(self, agent, mock_manager):
+        """new_session passes mcp_servers to _register_session_mcp_servers."""
+        with patch.object(agent, "_register_session_mcp_servers", new_callable=AsyncMock) as mock_reg:
+            resp = await agent.new_session(cwd="/tmp", mcp_servers=["fake"])
+            assert resp is not None
+            mock_reg.assert_called_once()
+            # Second arg should be the mcp_servers list
+            assert mock_reg.call_args[0][1] == ["fake"]
+
+    @pytest.mark.asyncio
+    async def test_load_session_calls_register(self, agent, mock_manager):
+        """load_session passes mcp_servers to _register_session_mcp_servers."""
+        # Create a session first so load can find it
+        state = mock_manager.create_session(cwd="/tmp")
+        sid = state.session_id
+
+        with patch.object(agent, "_register_session_mcp_servers", new_callable=AsyncMock) as mock_reg:
+            resp = await agent.load_session(cwd="/tmp", session_id=sid, mcp_servers=["fake"])
+            assert resp is not None
+            mock_reg.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_resume_session_calls_register(self, agent, mock_manager):
+        """resume_session passes mcp_servers to _register_session_mcp_servers."""
+        state = mock_manager.create_session(cwd="/tmp")
+        sid = state.session_id
+
+        with patch.object(agent, "_register_session_mcp_servers", new_callable=AsyncMock) as mock_reg:
+            resp = await agent.resume_session(cwd="/tmp", session_id=sid, mcp_servers=["fake"])
+            assert resp is not None
+            mock_reg.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_fork_session_calls_register(self, agent, mock_manager):
+        """fork_session passes mcp_servers to _register_session_mcp_servers."""
+        state = mock_manager.create_session(cwd="/tmp")
+        sid = state.session_id
+
+        with patch.object(agent, "_register_session_mcp_servers", new_callable=AsyncMock) as mock_reg:
+            resp = await agent.fork_session(cwd="/tmp", session_id=sid, mcp_servers=["fake"])
+            assert resp is not None
+            mock_reg.assert_called_once()

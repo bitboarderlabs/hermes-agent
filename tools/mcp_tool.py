@@ -70,6 +70,7 @@ Thread safety:
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import math
@@ -89,6 +90,8 @@ logger = logging.getLogger(__name__)
 _MCP_AVAILABLE = False
 _MCP_HTTP_AVAILABLE = False
 _MCP_SAMPLING_TYPES = False
+_MCP_NOTIFICATION_TYPES = False
+_MCP_MESSAGE_HANDLER_SUPPORTED = False
 try:
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
@@ -98,6 +101,13 @@ try:
         _MCP_HTTP_AVAILABLE = True
     except ImportError:
         _MCP_HTTP_AVAILABLE = False
+    # Prefer the non-deprecated API (mcp >= 1.24.0); fall back to the
+    # deprecated wrapper for older SDK versions.
+    try:
+        from mcp.client.streamable_http import streamable_http_client
+        _MCP_NEW_HTTP = True
+    except ImportError:
+        _MCP_NEW_HTTP = False
     # Sampling types -- separated so older SDK versions don't break MCP support
     try:
         from mcp.types import (
@@ -112,8 +122,38 @@ try:
         _MCP_SAMPLING_TYPES = True
     except ImportError:
         logger.debug("MCP sampling types not available -- sampling disabled")
+    # Notification types for dynamic tool discovery (tools/list_changed)
+    try:
+        from mcp.types import (
+            ServerNotification,
+            ToolListChangedNotification,
+            PromptListChangedNotification,
+            ResourceListChangedNotification,
+        )
+        _MCP_NOTIFICATION_TYPES = True
+    except ImportError:
+        logger.debug("MCP notification types not available -- dynamic tool discovery disabled")
 except ImportError:
     logger.debug("mcp package not installed -- MCP tool support disabled")
+
+
+def _check_message_handler_support() -> bool:
+    """Check if ClientSession accepts ``message_handler`` kwarg.
+
+    Inspects the constructor signature for backward compatibility with older
+    MCP SDK versions that don't support notification handlers.
+    """
+    if not _MCP_AVAILABLE:
+        return False
+    try:
+        return "message_handler" in inspect.signature(ClientSession).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+_MCP_MESSAGE_HANDLER_SUPPORTED = _check_message_handler_support()
+if _MCP_AVAILABLE and not _MCP_MESSAGE_HANDLER_SUPPORTED:
+    logger.debug("MCP SDK does not support message_handler -- dynamic tool discovery disabled")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -690,7 +730,7 @@ class MCPServerTask:
     __slots__ = (
         "name", "session", "tool_timeout",
         "_task", "_ready", "_shutdown_event", "_tools", "_error", "_config",
-        "_sampling", "_registered_tool_names", "_auth_type",
+        "_sampling", "_registered_tool_names", "_auth_type", "_refresh_lock",
     )
 
     def __init__(self, name: str):
@@ -706,10 +746,79 @@ class MCPServerTask:
         self._sampling: Optional[SamplingHandler] = None
         self._registered_tool_names: list[str] = []
         self._auth_type: str = ""
+        self._refresh_lock = asyncio.Lock()
 
     def _is_http(self) -> bool:
         """Check if this server uses HTTP transport."""
         return "url" in self._config
+
+    # ----- Dynamic tool discovery (notifications/tools/list_changed) -----
+
+    def _make_message_handler(self):
+        """Build a ``message_handler`` callback for ``ClientSession``.
+
+        Dispatches on notification type.  Only ``ToolListChangedNotification``
+        triggers a refresh; prompt and resource change notifications are
+        logged as stubs for future work.
+        """
+        async def _handler(message):
+            try:
+                if isinstance(message, Exception):
+                    logger.debug("MCP message handler (%s): exception: %s", self.name, message)
+                    return
+                if _MCP_NOTIFICATION_TYPES and isinstance(message, ServerNotification):
+                    match message.root:
+                        case ToolListChangedNotification():
+                            logger.info(
+                                "MCP server '%s': received tools/list_changed notification",
+                                self.name,
+                            )
+                            await self._refresh_tools()
+                        case PromptListChangedNotification():
+                            logger.debug("MCP server '%s': prompts/list_changed (ignored)", self.name)
+                        case ResourceListChangedNotification():
+                            logger.debug("MCP server '%s': resources/list_changed (ignored)", self.name)
+                        case _:
+                            pass
+            except Exception:
+                logger.exception("Error in MCP message handler for '%s'", self.name)
+        return _handler
+
+    async def _refresh_tools(self):
+        """Re-fetch tools from the server and update the registry.
+
+        Called when the server sends ``notifications/tools/list_changed``.
+        The lock prevents overlapping refreshes from rapid-fire notifications.
+        After the initial ``await`` (list_tools), all mutations are synchronous
+        — atomic from the event loop's perspective.
+        """
+        from tools.registry import registry
+        from toolsets import TOOLSETS
+
+        async with self._refresh_lock:
+            # 1. Fetch current tool list from server
+            tools_result = await self.session.list_tools()
+            new_mcp_tools = tools_result.tools if hasattr(tools_result, "tools") else []
+
+            # 2. Remove old tools from hermes-* umbrella toolsets
+            for ts_name, ts in TOOLSETS.items():
+                if ts_name.startswith("hermes-"):
+                    ts["tools"] = [t for t in ts["tools"] if t not in self._registered_tool_names]
+
+            # 3. Deregister old tools from the central registry
+            for prefixed_name in self._registered_tool_names:
+                registry.deregister(prefixed_name)
+
+            # 4. Re-register with fresh tool list
+            self._tools = new_mcp_tools
+            self._registered_tool_names = _register_server_tools(
+                self.name, self, self._config
+            )
+
+            logger.info(
+                "MCP server '%s': dynamically refreshed %d tool(s)",
+                self.name, len(self._registered_tool_names),
+            )
 
     async def _run_stdio(self, config: dict):
         """Run the server using stdio transport."""
@@ -731,6 +840,8 @@ class MCPServerTask:
         )
 
         sampling_kwargs = self._sampling.session_kwargs() if self._sampling else {}
+        if _MCP_NOTIFICATION_TYPES and _MCP_MESSAGE_HANDLER_SUPPORTED:
+            sampling_kwargs["message_handler"] = self._make_message_handler()
         async with stdio_client(server_params) as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
                 await session.initialize()
@@ -762,21 +873,52 @@ class MCPServerTask:
                 logger.warning("MCP OAuth setup failed for '%s': %s", self.name, exc)
 
         sampling_kwargs = self._sampling.session_kwargs() if self._sampling else {}
-        _http_kwargs: dict = {
-            "headers": headers,
-            "timeout": float(connect_timeout),
-        }
-        if _oauth_auth is not None:
-            _http_kwargs["auth"] = _oauth_auth
-        async with streamablehttp_client(url, **_http_kwargs) as (
-            read_stream, write_stream, _get_session_id,
-        ):
-            async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
-                await session.initialize()
-                self.session = session
-                await self._discover_tools()
-                self._ready.set()
-                await self._shutdown_event.wait()
+        if _MCP_NOTIFICATION_TYPES and _MCP_MESSAGE_HANDLER_SUPPORTED:
+            sampling_kwargs["message_handler"] = self._make_message_handler()
+
+        if _MCP_NEW_HTTP:
+            # New API (mcp >= 1.24.0): build an explicit httpx.AsyncClient
+            # matching the SDK's own create_mcp_http_client defaults.
+            import httpx
+
+            client_kwargs: dict = {
+                "follow_redirects": True,
+                "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
+            }
+            if headers:
+                client_kwargs["headers"] = headers
+            if _oauth_auth is not None:
+                client_kwargs["auth"] = _oauth_auth
+
+            # Caller owns the client lifecycle — the SDK skips cleanup when
+            # http_client is provided, so we wrap in async-with.
+            async with httpx.AsyncClient(**client_kwargs) as http_client:
+                async with streamable_http_client(url, http_client=http_client) as (
+                    read_stream, write_stream, _get_session_id,
+                ):
+                    async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
+                        await session.initialize()
+                        self.session = session
+                        await self._discover_tools()
+                        self._ready.set()
+                        await self._shutdown_event.wait()
+        else:
+            # Deprecated API (mcp < 1.24.0): manages httpx client internally.
+            _http_kwargs: dict = {
+                "headers": headers,
+                "timeout": float(connect_timeout),
+            }
+            if _oauth_auth is not None:
+                _http_kwargs["auth"] = _oauth_auth
+            async with streamablehttp_client(url, **_http_kwargs) as (
+                read_stream, write_stream, _get_session_id,
+            ):
+                async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
+                    await session.initialize()
+                    self.session = session
+                    await self._discover_tools()
+                    self._ready.set()
+                    await self._shutdown_event.wait()
 
     async def _discover_tools(self):
         """Discover tools from the connected session."""
@@ -797,7 +939,7 @@ class MCPServerTask:
         """
         self._config = config
         self.tool_timeout = config.get("timeout", _DEFAULT_TOOL_TIMEOUT)
-        self._auth_type = config.get("auth", "").lower().strip()
+        self._auth_type = (config.get("auth") or "").lower().strip()
 
         # Set up sampling handler if enabled and SDK types are available
         sampling_config = config.get("sampling", {})
@@ -1264,6 +1406,17 @@ def _normalize_mcp_input_schema(schema: dict | None) -> dict:
     return schema
 
 
+def sanitize_mcp_name_component(value: str) -> str:
+    """Return an MCP name component safe for tool and prefix generation.
+
+    Preserves Hermes's historical behavior of converting hyphens to
+    underscores, and also replaces any other character outside
+    ``[A-Za-z0-9_]`` with ``_`` so generated tool names are compatible with
+    provider validation rules.
+    """
+    return re.sub(r"[^A-Za-z0-9_]", "_", str(value or ""))
+
+
 def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
     """Convert an MCP tool listing to the Hermes registry schema format.
 
@@ -1275,9 +1428,8 @@ def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
     Returns:
         A dict suitable for ``registry.register(schema=...)``.
     """
-    # Sanitize: replace hyphens and dots with underscores for LLM API compatibility
-    safe_tool_name = mcp_tool.name.replace("-", "_").replace(".", "_")
-    safe_server_name = server_name.replace("-", "_").replace(".", "_")
+    safe_tool_name = sanitize_mcp_name_component(mcp_tool.name)
+    safe_server_name = sanitize_mcp_name_component(server_name)
     prefixed_name = f"mcp_{safe_server_name}_{safe_tool_name}"
     return {
         "name": prefixed_name,
@@ -1307,7 +1459,7 @@ def _sync_mcp_toolsets(server_names: Optional[List[str]] = None) -> None:
     all_mcp_tools: List[str] = []
 
     for server_name in server_names:
-        safe_prefix = f"mcp_{server_name.replace('-', '_').replace('.', '_')}_"
+        safe_prefix = f"mcp_{sanitize_mcp_name_component(server_name)}_"
         server_tools = sorted(
             t for t in existing if t.startswith(safe_prefix)
         )
@@ -1343,7 +1495,7 @@ def _build_utility_schemas(server_name: str) -> List[dict]:
     Returns a list of (schema, handler_factory_name) tuples encoded as dicts
     with keys: schema, handler_key.
     """
-    safe_name = server_name.replace("-", "_").replace(".", "_")
+    safe_name = sanitize_mcp_name_component(server_name)
     return [
         {
             "schema": {
@@ -1486,24 +1638,19 @@ def _existing_tool_names() -> List[str]:
     return names
 
 
-async def _discover_and_register_server(name: str, config: dict) -> List[str]:
-    """Connect to a single MCP server, discover tools, and register them.
+def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> List[str]:
+    """Register tools from an already-connected server into the registry.
 
-    Also registers utility tools for MCP Resources and Prompts support
-    (list_resources, read_resource, list_prompts, get_prompt).
+    Handles include/exclude filtering, utility tools, toolset creation,
+    and hermes-* umbrella toolset injection.
 
-    Returns list of registered tool names.
+    Used by both initial discovery and dynamic refresh (list_changed).
+
+    Returns:
+        List of registered prefixed tool names.
     """
     from tools.registry import registry
-    from toolsets import create_custom_toolset
-
-    connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
-    server = await asyncio.wait_for(
-        _connect_server(name, config),
-        timeout=connect_timeout,
-    )
-    with _lock:
-        _servers[name] = server
+    from toolsets import create_custom_toolset, TOOLSETS
 
     registered_names: List[str] = []
     toolset_name = f"mcp-{name}"
@@ -1532,6 +1679,16 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         schema = _convert_mcp_schema(name, mcp_tool)
         tool_name_prefixed = schema["name"]
 
+        # Guard against collisions with built-in (non-MCP) tools.
+        existing_toolset = registry.get_toolset_for_tool(tool_name_prefixed)
+        if existing_toolset and not existing_toolset.startswith("mcp-"):
+            logger.warning(
+                "MCP server '%s': tool '%s' (→ '%s') collides with built-in "
+                "tool in toolset '%s' — skipping to preserve built-in",
+                name, mcp_tool.name, tool_name_prefixed, existing_toolset,
+            )
+            continue
+
         registry.register(
             name=tool_name_prefixed,
             toolset=toolset_name,
@@ -1556,9 +1713,20 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         schema = entry["schema"]
         handler_key = entry["handler_key"]
         handler = _handler_factories[handler_key](name, server.tool_timeout)
+        util_name = schema["name"]
+
+        # Same collision guard for utility tools.
+        existing_toolset = registry.get_toolset_for_tool(util_name)
+        if existing_toolset and not existing_toolset.startswith("mcp-"):
+            logger.warning(
+                "MCP server '%s': utility tool '%s' collides with built-in "
+                "tool in toolset '%s' — skipping to preserve built-in",
+                name, util_name, existing_toolset,
+            )
+            continue
 
         registry.register(
-            name=schema["name"],
+            name=util_name,
             toolset=toolset_name,
             schema=schema,
             handler=handler,
@@ -1566,9 +1734,7 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
             is_async=False,
             description=schema["description"],
         )
-        registered_names.append(schema["name"])
-
-    server._registered_tool_names = list(registered_names)
+        registered_names.append(util_name)
 
     # Create a custom toolset so these tools are discoverable
     if registered_names:
@@ -1577,6 +1743,31 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
             description=f"MCP tools from {name} server",
             tools=registered_names,
         )
+        # Inject into hermes-* umbrella toolsets for default behavior
+        for ts_name, ts in TOOLSETS.items():
+            if ts_name.startswith("hermes-"):
+                for tool_name in registered_names:
+                    if tool_name not in ts["tools"]:
+                        ts["tools"].append(tool_name)
+
+    return registered_names
+
+
+async def _discover_and_register_server(name: str, config: dict) -> List[str]:
+    """Connect to a single MCP server, discover tools, and register them.
+
+    Returns list of registered tool names.
+    """
+    connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
+    server = await asyncio.wait_for(
+        _connect_server(name, config),
+        timeout=connect_timeout,
+    )
+    with _lock:
+        _servers[name] = server
+
+    registered_names = _register_server_tools(name, server, config)
+    server._registered_tool_names = list(registered_names)
 
     transport_type = "HTTP" if "url" in config else "stdio"
     logger.info(
@@ -1590,6 +1781,86 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
+    """Connect to explicit MCP servers and register their tools.
+
+    Idempotent for already-connected server names. Servers with
+    ``enabled: false`` are skipped without disconnecting existing sessions.
+
+    Args:
+        servers: Mapping of ``{server_name: server_config}``.
+
+    Returns:
+        List of all currently registered MCP tool names.
+    """
+    if not _MCP_AVAILABLE:
+        logger.debug("MCP SDK not available -- skipping explicit MCP registration")
+        return []
+
+    if not servers:
+        logger.debug("No explicit MCP servers provided")
+        return []
+
+    # Only attempt servers that aren't already connected and are enabled
+    # (enabled: false skips the server entirely without removing its config)
+    with _lock:
+        new_servers = {
+            k: v
+            for k, v in servers.items()
+            if k not in _servers and _parse_boolish(v.get("enabled", True), default=True)
+        }
+
+    if not new_servers:
+        _sync_mcp_toolsets(list(servers.keys()))
+        return _existing_tool_names()
+
+    # Start the background event loop for MCP connections
+    _ensure_mcp_loop()
+
+    async def _discover_one(name: str, cfg: dict) -> List[str]:
+        """Connect to a single server and return its registered tool names."""
+        return await _discover_and_register_server(name, cfg)
+
+    async def _discover_all():
+        server_names = list(new_servers.keys())
+        # Connect to all servers in PARALLEL
+        results = await asyncio.gather(
+            *(_discover_one(name, cfg) for name, cfg in new_servers.items()),
+            return_exceptions=True,
+        )
+        for name, result in zip(server_names, results):
+            if isinstance(result, Exception):
+                command = new_servers.get(name, {}).get("command")
+                logger.warning(
+                    "Failed to connect to MCP server '%s'%s: %s",
+                    name,
+                    f" (command={command})" if command else "",
+                    _format_connect_error(result),
+                )
+
+    # Per-server timeouts are handled inside _discover_and_register_server.
+    # The outer timeout is generous: 120s total for parallel discovery.
+    _run_on_mcp_loop(_discover_all(), timeout=120)
+
+    _sync_mcp_toolsets(list(servers.keys()))
+
+    # Log a summary so ACP callers get visibility into what was registered.
+    with _lock:
+        connected = [n for n in new_servers if n in _servers]
+        new_tool_count = sum(
+            len(getattr(_servers[n], "_registered_tool_names", []))
+            for n in connected
+        )
+    failed = len(new_servers) - len(connected)
+    if new_tool_count or failed:
+        summary = f"MCP: registered {new_tool_count} tool(s) from {len(connected)} server(s)"
+        if failed:
+            summary += f" ({failed} failed)"
+        logger.info(summary)
+
+    return _existing_tool_names()
+
 
 def discover_mcp_tools() -> List[str]:
     """Entry point: load config, connect to MCP servers, register tools.
@@ -1612,69 +1883,32 @@ def discover_mcp_tools() -> List[str]:
         logger.debug("No MCP servers configured")
         return []
 
-    # Only attempt servers that aren't already connected and are enabled
-    # (enabled: false skips the server entirely without removing its config)
     with _lock:
-        new_servers = {
-            k: v
-            for k, v in servers.items()
-            if k not in _servers and _parse_boolish(v.get("enabled", True), default=True)
-        }
+        new_server_names = [
+            name
+            for name, cfg in servers.items()
+            if name not in _servers and _parse_boolish(cfg.get("enabled", True), default=True)
+        ]
 
-    if not new_servers:
-        _sync_mcp_toolsets(list(servers.keys()))
-        return _existing_tool_names()
+    tool_names = register_mcp_servers(servers)
+    if not new_server_names:
+        return tool_names
 
-    # Start the background event loop for MCP connections
-    _ensure_mcp_loop()
-
-    all_tools: List[str] = []
-    failed_count = 0
-
-    async def _discover_one(name: str, cfg: dict) -> List[str]:
-        """Connect to a single server and return its registered tool names."""
-        return await _discover_and_register_server(name, cfg)
-
-    async def _discover_all():
-        nonlocal failed_count
-        server_names = list(new_servers.keys())
-        # Connect to all servers in PARALLEL
-        results = await asyncio.gather(
-            *(_discover_one(name, cfg) for name, cfg in new_servers.items()),
-            return_exceptions=True,
+    with _lock:
+        connected_server_names = [name for name in new_server_names if name in _servers]
+        new_tool_count = sum(
+            len(getattr(_servers[name], "_registered_tool_names", []))
+            for name in connected_server_names
         )
-        for name, result in zip(server_names, results):
-            if isinstance(result, Exception):
-                failed_count += 1
-                command = new_servers.get(name, {}).get("command")
-                logger.warning(
-                    "Failed to connect to MCP server '%s'%s: %s",
-                    name,
-                    f" (command={command})" if command else "",
-                    _format_connect_error(result),
-                )
-            elif isinstance(result, list):
-                all_tools.extend(result)
-            else:
-                failed_count += 1
 
-    # Per-server timeouts are handled inside _discover_and_register_server.
-    # The outer timeout is generous: 120s total for parallel discovery.
-    _run_on_mcp_loop(_discover_all(), timeout=120)
-
-    _sync_mcp_toolsets(list(servers.keys()))
-
-    # Print summary
-    total_servers = len(new_servers)
-    ok_servers = total_servers - failed_count
-    if all_tools or failed_count:
-        summary = f"  MCP: {len(all_tools)} tool(s) from {ok_servers} server(s)"
+    failed_count = len(new_server_names) - len(connected_server_names)
+    if new_tool_count or failed_count:
+        summary = f"  MCP: {new_tool_count} tool(s) from {len(connected_server_names)} server(s)"
         if failed_count:
             summary += f" ({failed_count} failed)"
         logger.info(summary)
 
-    # Return ALL registered tools (existing + newly discovered)
-    return _existing_tool_names()
+    return tool_names
 
 
 def get_mcp_status() -> List[dict]:

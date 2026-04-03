@@ -2,7 +2,7 @@
 OpenAI-compatible API server platform adapter.
 
 Exposes an HTTP server with endpoints:
-- POST /v1/chat/completions        — OpenAI Chat Completions format (stateless)
+- POST /v1/chat/completions        — OpenAI Chat Completions format (stateless; opt-in session continuity via X-Hermes-Session-Id header)
 - POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id)
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
@@ -166,7 +166,7 @@ class ResponseStore:
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
 }
 
 
@@ -222,6 +222,23 @@ if AIOHTTP_AVAILABLE:
         return await handler(request)
 else:
     body_limit_middleware = None  # type: ignore[assignment]
+
+_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+}
+
+
+if AIOHTTP_AVAILABLE:
+    @web.middleware
+    async def security_headers_middleware(request, handler):
+        """Add security headers to all responses (including errors)."""
+        response = await handler(request)
+        for k, v in _SECURITY_HEADERS.items():
+            response.headers.setdefault(k, v)
+        return response
+else:
+    security_headers_middleware = None  # type: ignore[assignment]
 
 
 class _IdempotencyCache:
@@ -283,6 +300,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
+        self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -307,6 +325,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if "*" in self._cors_origins:
             headers = dict(_CORS_HEADERS)
             headers["Access-Control-Allow-Origin"] = "*"
+            headers["Access-Control-Max-Age"] = "600"
             return headers
 
         if origin not in self._cors_origins:
@@ -315,6 +334,7 @@ class APIServerAdapter(BasePlatformAdapter):
         headers = dict(_CORS_HEADERS)
         headers["Access-Control-Allow-Origin"] = origin
         headers["Vary"] = "Origin"
+        headers["Access-Control-Max-Age"] = "600"
         return headers
 
     def _origin_allowed(self, origin: str) -> bool:
@@ -361,18 +381,25 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        tool_progress_callback=None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
 
         Uses _resolve_runtime_agent_kwargs() to pick up model, api_key,
-        base_url, etc. from config.yaml / env vars.
+        base_url, etc. from config.yaml / env vars.  Toolsets are resolved
+        from config.yaml platform_toolsets.api_server (same as all other
+        gateway platforms), falling back to the hermes-api-server default.
         """
         from run_agent import AIAgent
-        from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model
+        from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model, _load_gateway_config
+        from hermes_cli.tools_config import _get_platform_tools
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         model = _resolve_gateway_model()
+
+        user_config = _load_gateway_config()
+        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
@@ -383,9 +410,11 @@ class APIServerAdapter(BasePlatformAdapter):
             quiet_mode=True,
             verbose_logging=False,
             ephemeral_system_prompt=ephemeral_system_prompt or None,
+            enabled_toolsets=enabled_toolsets,
             session_id=session_id,
             platform="api_server",
             stream_delta_callback=stream_delta_callback,
+            tool_progress_callback=tool_progress_callback,
         )
         return agent
 
@@ -468,7 +497,24 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
-        session_id = body.get("session_id") or str(uuid.uuid4())  # BOTPARLOR_SSE: allow client-specified session
+        # Allow caller to continue an existing session by passing X-Hermes-Session-Id
+        # header or session_id in the request body.
+        # When provided, history is loaded from state.db instead of from the request body.
+        provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip() or body.get("session_id", "")
+        if provided_session_id:
+            session_id = provided_session_id
+            try:
+                if self._session_db is None:
+                    from hermes_state import SessionDB
+                    self._session_db = SessionDB()
+                history = self._session_db.get_messages_as_conversation(session_id)
+            except Exception as e:
+                logger.warning("Failed to load session history for %s: %s", session_id, e)
+                history = []
+        else:
+            session_id = str(uuid.uuid4())
+            # history already set from request body above
+
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", "hermes-agent")
         created = int(time.time())
@@ -481,6 +527,13 @@ class APIServerAdapter(BasePlatformAdapter):
             # NOTE: None from the agent is a mid-stream flush signal (before tool execution),
             # NOT the end of stream.  We skip it here; the stream ends when agent_task completes.
             def _on_delta(delta):
+                # Filter out None — the agent fires stream_delta_callback(None)
+                # to signal the CLI display to close its response box before
+                # tool execution, but the SSE writer uses None as end-of-stream
+                # sentinel.  Forwarding it would prematurely close the HTTP
+                # response, causing Open WebUI (and similar frontends) to miss
+                # the final answer after tool calls.  The SSE loop detects
+                # completion via agent_task.done() instead.
                 if delta is not None:
                     _stream_q.put(("delta", delta))
 
@@ -488,7 +541,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 _stream_q.put((event_type, data))
             # ── /BOTPARLOR_SSE ──
 
-            # Start agent in background
+            def _on_tool_progress(name, preview, args):
+                """Inject tool progress into the SSE stream for Open WebUI."""
+                if name.startswith("_"):
+                    return  # Skip internal events (_thinking)
+                from agent.display import get_tool_emoji
+                emoji = get_tool_emoji(name)
+                label = preview or name
+                _stream_q.put(f"\n`{emoji} {label}`\n")
+
+            # Start agent in background.  agent_ref is a mutable container
+            # so the SSE writer can interrupt the agent on client disconnect.
+            agent_ref = [None]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=history,
@@ -496,10 +560,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
                 botparlor_event_callback=_on_bp_event,  # BOTPARLOR_SSE
+                tool_progress_callback=_on_tool_progress,
+                agent_ref=agent_ref,
             ))
 
             return await self._write_sse_chat_completion(
-                request, completion_id, model_name, created, _stream_q, agent_task
+                request, completion_id, model_name, created, _stream_q,
+                agent_task, agent_ref, session_id=session_id,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -558,112 +625,133 @@ class APIServerAdapter(BasePlatformAdapter):
             },
         }
 
-        return web.json_response(response_data)
+        return web.json_response(response_data, headers={"X-Hermes-Session-Id": session_id})
 
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
-        created: int, stream_q, agent_task,
+        created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
     ) -> "web.StreamResponse":
-        """Write real streaming SSE from agent's stream_delta_callback queue."""
+        """Write real streaming SSE from agent's stream_delta_callback queue.
+
+        If the client disconnects mid-stream (network drop, browser tab close),
+        the agent is interrupted via ``agent.interrupt()`` so it stops making
+        LLM API calls, and the asyncio task wrapper is cancelled.
+        """
         import queue as _q
 
-        response = web.StreamResponse(
-            status=200,
-            headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
-        )
+        sse_headers = {"Content-Type": "text/event-stream", "Cache-Control": "no-cache"}
+        # CORS middleware can't inject headers into StreamResponse after
+        # prepare() flushes them, so resolve CORS headers up front.
+        origin = request.headers.get("Origin", "")
+        cors = self._cors_headers_for_origin(origin) if origin else None
+        if cors:
+            sse_headers.update(cors)
+        if session_id:
+            sse_headers["X-Hermes-Session-Id"] = session_id
+        response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
 
-        # Role chunk
-        role_chunk = {
-            "id": completion_id, "object": "chat.completion.chunk",
-            "created": created, "model": model,
-            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-        }
-        await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
+        try:
+            # Role chunk
+            role_chunk = {
+                "id": completion_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+            }
+            await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
 
-        # Stream content chunks as they arrive from the agent
-        loop = asyncio.get_event_loop()
-        while True:
-            try:
-                item = await loop.run_in_executor(None, lambda: stream_q.get(timeout=0.5))  # BOTPARLOR_SSE: renamed delta→item
-            except _q.Empty:
-                if agent_task.done():
-                    # Drain any remaining items  # BOTPARLOR_SSE: structured event support
-                    while True:
-                        try:
-                            item = stream_q.get_nowait()
-                            if item is None:
+            # Stream content chunks as they arrive from the agent
+            loop = asyncio.get_event_loop()
+            while True:
+                try:
+                    item = await loop.run_in_executor(None, lambda: stream_q.get(timeout=0.5))
+                except _q.Empty:
+                    if agent_task.done():
+                        # Drain any remaining items
+                        while True:
+                            try:
+                                delta = stream_q.get_nowait()
+                                if delta is None:
+                                    break
+                                content_chunk = {
+                                    "id": completion_id, "object": "chat.completion.chunk",
+                                    "created": created, "model": model,
+                                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+                                }
+                                await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                            except _q.Empty:
                                 break
-                            # ── BOTPARLOR_SSE: dispatch on event type ──
-                            if isinstance(item, tuple):
-                                evt_type, evt_data = item
-                                if evt_type == "delta":
-                                    _c = {"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                                          "choices": [{"index": 0, "delta": {"content": evt_data}, "finish_reason": None}]}
-                                    await response.write(f"data: {json.dumps(_c)}\n\n".encode())
-                                else:
-                                    await response.write(f"event: {evt_type}\ndata: {json.dumps(evt_data)}\n\n".encode())
-                            else:
-                                _c = {"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                                      "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}]}
-                                await response.write(f"data: {json.dumps(_c)}\n\n".encode())
-                            # ── /BOTPARLOR_SSE ──
-                        except _q.Empty:
-                            break
+                        break
+                    continue
+
+                if item is None:  # End of stream sentinel
                     break
-                continue
 
-            if item is None:  # End of stream sentinel
-                break
-
-            # ── BOTPARLOR_SSE: dispatch on event type ──
-            if isinstance(item, tuple):
-                evt_type, evt_data = item
-                if evt_type == "delta":
-                    content_chunk = {"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                                    "choices": [{"index": 0, "delta": {"content": evt_data}, "finish_reason": None}]}
-                    await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                # ── BOTPARLOR_SSE: dispatch on event type ──
+                if isinstance(item, tuple):
+                    evt_type, evt_data = item
+                    if evt_type == "delta":
+                        content_chunk = {"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                        "choices": [{"index": 0, "delta": {"content": evt_data}, "finish_reason": None}]}
+                        await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                    else:
+                        await response.write(f"event: {evt_type}\ndata: {json.dumps(evt_data)}\n\n".encode())
                 else:
-                    await response.write(f"event: {evt_type}\ndata: {json.dumps(evt_data)}\n\n".encode())
-            else:
-                content_chunk = {"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model,
-                                "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}]}
-                await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                    content_chunk = {"id": completion_id, "object": "chat.completion.chunk", "created": created, "model": model,
+                                    "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}]}
+                    await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
+                # ── /BOTPARLOR_SSE ──
+
+            # Get usage from completed agent
+            usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            try:
+                result, agent_usage = await agent_task
+                usage = agent_usage or usage
+            except Exception:
+                pass
+
+            # ── BOTPARLOR_SSE: emit turn.complete with enriched data ──
+            _bp_turn = {
+                "model": model,
+                "input_tokens": usage.get("input_tokens", 0),
+                "output_tokens": usage.get("output_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
+                "cache_read_tokens": usage.get("cache_read_tokens", 0),
+                "cache_write_tokens": usage.get("cache_write_tokens", 0),
+            }
+            await response.write(f"event: turn.complete\ndata: {json.dumps(_bp_turn)}\n\n".encode())
             # ── /BOTPARLOR_SSE ──
 
-        # Get usage from completed agent
-        usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-        try:
-            result, agent_usage = await agent_task
-            usage = agent_usage or usage
-        except Exception:
-            pass
-
-        # ── BOTPARLOR_SSE: emit turn.complete with enriched data ──
-        _bp_turn = {
-            "model": model,
-            "input_tokens": usage.get("input_tokens", 0),
-            "output_tokens": usage.get("output_tokens", 0),
-            "total_tokens": usage.get("total_tokens", 0),
-            "cache_read_tokens": usage.get("cache_read_tokens", 0),
-            "cache_write_tokens": usage.get("cache_write_tokens", 0),
-        }
-        await response.write(f"event: turn.complete\ndata: {json.dumps(_bp_turn)}\n\n".encode())
-        # ── /BOTPARLOR_SSE ──
-
-        # Finish chunk
-        finish_chunk = {
-            "id": completion_id, "object": "chat.completion.chunk",
-            "created": created, "model": model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            "usage": {
-                "prompt_tokens": usage.get("input_tokens", 0),
-                "completion_tokens": usage.get("output_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
-            },
-        }
-        await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
-        await response.write(b"data: [DONE]\n\n")
+            # Finish chunk
+            finish_chunk = {
+                "id": completion_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": usage.get("input_tokens", 0),
+                    "completion_tokens": usage.get("output_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                },
+            }
+            await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
+            await response.write(b"data: [DONE]\n\n")
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+            # Client disconnected mid-stream.  Interrupt the agent so it
+            # stops making LLM API calls at the next loop iteration, then
+            # cancel the asyncio task wrapper.
+            agent = agent_ref[0] if agent_ref else None
+            if agent is not None:
+                try:
+                    agent.interrupt("SSE client disconnected")
+                except Exception:
+                    pass
+            if not agent_task.done():
+                agent_task.cancel()
+                try:
+                    await agent_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            logger.info("SSE client disconnected; interrupted agent task %s", completion_id)
 
         return response
 
@@ -1167,12 +1255,19 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: Optional[str] = None,
         stream_delta_callback=None,
         botparlor_event_callback=None,  # BOTPARLOR_SSE
+        tool_progress_callback=None,
+        agent_ref: Optional[list] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
 
         Returns ``(result_dict, usage_dict)`` where *usage_dict* contains
         ``input_tokens``, ``output_tokens`` and ``total_tokens``.
+
+        If *agent_ref* is a one-element list, the AIAgent instance is stored
+        at ``agent_ref[0]`` before ``run_conversation`` begins.  This allows
+        callers (e.g. the SSE writer) to call ``agent.interrupt()`` from
+        another thread to stop in-progress LLM calls.
         """
         loop = asyncio.get_event_loop()
 
@@ -1181,7 +1276,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
                 stream_delta_callback=stream_delta_callback,
+                tool_progress_callback=tool_progress_callback,
             )
+            if agent_ref is not None:
+                agent_ref[0] = agent
             # ── BOTPARLOR_SSE: wire tool/thinking callbacks ──
             if botparlor_event_callback:
                 _orig_progress = agent.tool_progress_callback
@@ -1235,10 +1333,11 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
 
         try:
-            mws = [mw for mw in (cors_middleware, body_limit_middleware) if mw is not None]
+            mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
             self._app = web.Application(middlewares=mws)
             self._app["api_server_adapter"] = self
             self._app.router.add_get("/health", self._handle_health)
+            self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
@@ -1253,6 +1352,17 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
             self._app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
+
+            # Port conflict detection — fail fast if port is already in use
+            import socket as _socket
+            try:
+                with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as _s:
+                    _s.settimeout(1)
+                    _s.connect(('127.0.0.1', self._port))
+                logger.error('[%s] Port %d already in use. Set a different port in config.yaml: platforms.api_server.port', self.name, self._port)
+                return False
+            except (ConnectionRefusedError, OSError):
+                pass  # port is free
 
             self._runner = web.AppRunner(self._app)
             await self._runner.setup()

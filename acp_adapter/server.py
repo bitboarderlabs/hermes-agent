@@ -22,9 +22,15 @@ from acp.schema import (
     InitializeResponse,
     ListSessionsResponse,
     LoadSessionResponse,
+    McpServerHttp,
+    McpServerSse,
+    McpServerStdio,
     NewSessionResponse,
     PromptResponse,
     ResumeSessionResponse,
+    SetSessionConfigOptionResponse,
+    SetSessionModelResponse,
+    SetSessionModeResponse,
     ResourceContentBlock,
     SessionCapabilities,
     SessionForkCapabilities,
@@ -90,15 +96,83 @@ class HermesACPAgent(acp.Agent):
         self._conn = conn
         logger.info("ACP client connected")
 
+    async def _register_session_mcp_servers(
+        self,
+        state: SessionState,
+        mcp_servers: list[McpServerStdio | McpServerHttp | McpServerSse] | None,
+    ) -> None:
+        """Register ACP-provided MCP servers and refresh the agent tool surface."""
+        if not mcp_servers:
+            return
+
+        try:
+            from tools.mcp_tool import register_mcp_servers
+
+            config_map: dict[str, dict] = {}
+            for server in mcp_servers:
+                name = server.name
+                if isinstance(server, McpServerStdio):
+                    config = {
+                        "command": server.command,
+                        "args": list(server.args),
+                        "env": {item.name: item.value for item in server.env},
+                    }
+                else:
+                    config = {
+                        "url": server.url,
+                        "headers": {item.name: item.value for item in server.headers},
+                    }
+                config_map[name] = config
+
+            await asyncio.to_thread(register_mcp_servers, config_map)
+        except Exception:
+            logger.warning(
+                "Session %s: failed to register ACP MCP servers",
+                state.session_id,
+                exc_info=True,
+            )
+            return
+
+        try:
+            from model_tools import get_tool_definitions
+
+            enabled_toolsets = getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"]
+            disabled_toolsets = getattr(state.agent, "disabled_toolsets", None)
+            state.agent.tools = get_tool_definitions(
+                enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=disabled_toolsets,
+                quiet_mode=True,
+            )
+            state.agent.valid_tool_names = {
+                tool["function"]["name"] for tool in state.agent.tools or []
+            }
+            invalidate = getattr(state.agent, "_invalidate_system_prompt", None)
+            if callable(invalidate):
+                invalidate()
+            logger.info(
+                "Session %s: refreshed tool surface after ACP MCP registration (%d tools)",
+                state.session_id,
+                len(state.agent.tools or []),
+            )
+        except Exception:
+            logger.warning(
+                "Session %s: failed to refresh tool surface after ACP MCP registration",
+                state.session_id,
+                exc_info=True,
+            )
+
     # ---- ACP lifecycle ------------------------------------------------------
 
     async def initialize(
         self,
-        protocol_version: int,
+        protocol_version: int | None = None,
         client_capabilities: ClientCapabilities | None = None,
         client_info: Implementation | None = None,
         **kwargs: Any,
     ) -> InitializeResponse:
+        resolved_protocol_version = (
+            protocol_version if isinstance(protocol_version, int) else acp.PROTOCOL_VERSION
+        )
         provider = detect_provider()
         auth_methods = None
         if provider:
@@ -111,7 +185,11 @@ class HermesACPAgent(acp.Agent):
             ]
 
         client_name = client_info.name if client_info else "unknown"
-        logger.info("Initialize from %s (protocol v%s)", client_name, protocol_version)
+        logger.info(
+            "Initialize from %s (protocol v%s)",
+            client_name,
+            resolved_protocol_version,
+        )
 
         return InitializeResponse(
             protocol_version=acp.PROTOCOL_VERSION,
@@ -139,6 +217,7 @@ class HermesACPAgent(acp.Agent):
         **kwargs: Any,
     ) -> NewSessionResponse:
         state = self.session_manager.create_session(cwd=cwd)
+        await self._register_session_mcp_servers(state, mcp_servers)
         logger.info("New session %s (cwd=%s)", state.session_id, cwd)
         return NewSessionResponse(session_id=state.session_id)
 
@@ -153,6 +232,7 @@ class HermesACPAgent(acp.Agent):
         if state is None:
             logger.warning("load_session: session %s not found", session_id)
             return None
+        await self._register_session_mcp_servers(state, mcp_servers)
         logger.info("Loaded session %s", session_id)
         return LoadSessionResponse()
 
@@ -167,6 +247,7 @@ class HermesACPAgent(acp.Agent):
         if state is None:
             logger.warning("resume_session: session %s not found, creating new", session_id)
             state = self.session_manager.create_session(cwd=cwd)
+        await self._register_session_mcp_servers(state, mcp_servers)
         logger.info("Resumed session %s", state.session_id)
         return ResumeSessionResponse()
 
@@ -190,6 +271,8 @@ class HermesACPAgent(acp.Agent):
     ) -> ForkSessionResponse:
         state = self.session_manager.fork_session(session_id, cwd=cwd)
         new_id = state.session_id if state else ""
+        if state is not None:
+            await self._register_session_mcp_servers(state, mcp_servers)
         logger.info("Forked session %s -> %s", session_id, new_id)
         return ForkSessionResponse(session_id=new_id)
 
@@ -471,7 +554,7 @@ class HermesACPAgent(acp.Agent):
 
     async def set_session_model(
         self, model_id: str, session_id: str, **kwargs: Any
-    ):
+    ) -> SetSessionModelResponse | None:
         """Switch the model for a session (called by ACP protocol)."""
         state = self.session_manager.get_session(session_id)
         if state:
@@ -489,4 +572,37 @@ class HermesACPAgent(acp.Agent):
             )
             self.session_manager.save_session(session_id)
             logger.info("Session %s: model switched to %s", session_id, model_id)
+            return SetSessionModelResponse()
+        logger.warning("Session %s: model switch requested for missing session", session_id)
         return None
+
+    async def set_session_mode(
+        self, mode_id: str, session_id: str, **kwargs: Any
+    ) -> SetSessionModeResponse | None:
+        """Persist the editor-requested mode so ACP clients do not fail on mode switches."""
+        state = self.session_manager.get_session(session_id)
+        if state is None:
+            logger.warning("Session %s: mode switch requested for missing session", session_id)
+            return None
+        setattr(state, "mode", mode_id)
+        self.session_manager.save_session(session_id)
+        logger.info("Session %s: mode switched to %s", session_id, mode_id)
+        return SetSessionModeResponse()
+
+    async def set_config_option(
+        self, config_id: str, session_id: str, value: str, **kwargs: Any
+    ) -> SetSessionConfigOptionResponse | None:
+        """Accept ACP config option updates even when Hermes has no typed ACP config surface yet."""
+        state = self.session_manager.get_session(session_id)
+        if state is None:
+            logger.warning("Session %s: config update requested for missing session", session_id)
+            return None
+
+        options = getattr(state, "config_options", None)
+        if not isinstance(options, dict):
+            options = {}
+        options[str(config_id)] = value
+        setattr(state, "config_options", options)
+        self.session_manager.save_session(session_id)
+        logger.info("Session %s: config option %s updated", session_id, config_id)
+        return SetSessionConfigOptionResponse(config_options=[])
