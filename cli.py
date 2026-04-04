@@ -6552,6 +6552,14 @@ class HermesCLI:
         self._voice_tts_done = threading.Event()  # Signals TTS playback finished
         self._voice_tts_done.set()  # Initially "done" (no TTS pending)
 
+        # Auto-enable voice mode if configured
+        try:
+            voice_config = self.config.get("voice", {})
+            if voice_config.get("enabled", False):
+                self._enable_voice_mode()
+        except Exception:
+            pass
+
         # Register callbacks so terminal_tool prompts route through our UI
         set_sudo_password_callback(self._sudo_password_callback)
         set_approval_callback(self._approval_callback)

@@ -350,6 +350,83 @@ def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
     return output_path
 
 
+def _check_kokoro_available() -> bool:
+    """Check if Kokoro TTS service is available at the configured endpoint."""
+    try:
+        tts_config = _load_tts_config()
+        kokoro_config = tts_config.get("kokoro", {})
+        base_url = kokoro_config.get("base_url", "http://localhost:8880")
+
+        import urllib.request
+        test_url = f"{base_url.rstrip('/')}/voices"
+        try:
+            with urllib.request.urlopen(test_url, timeout=3) as resp:
+                return resp.status == 200
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError):
+            return False
+    except Exception:
+        return False
+
+
+def _generate_kokoro(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate audio using Kokoro TTS server.
+
+    Args:
+        text: Text to synthesize
+        output_path: Path to save the output audio file
+        tts_config: Full TTS config dict
+
+    Returns:
+        Path to the generated audio file
+    """
+    import urllib.request
+    import base64
+
+    kokoro_config = tts_config.get("kokoro", {})
+    base_url = kokoro_config.get("base_url", "http://localhost:8880")
+    endpoint = kokoro_config.get("endpoint", "synthesize")
+    voice = kokoro_config.get("voice", "af_bella")
+    output_format = kokoro_config.get("output_format", "wav")
+
+    url = f"{base_url.rstrip('/')}/{endpoint}"
+    data = {
+        "text": text,
+        "voice": voice
+    }
+
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(data).encode('utf-8'),
+        headers={'Content-Type': 'application/json'},
+        method='POST'
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            result = json.loads(response.read().decode('utf-8'))
+
+            audio_url = result.get("audio_url")
+            if not audio_url:
+                raise RuntimeError(f"No audio_url in Kokoro response: {result}")
+
+            if audio_url.startswith("data:audio/"):
+                mime_part = audio_url.split(",", 1)[1]
+                audio_data = base64.b64decode(mime_part)
+            else:
+                with urllib.request.urlopen(audio_url, timeout=30) as audio_resp:
+                    audio_data = audio_resp.read()
+
+            with open(output_path, 'wb') as f:
+                f.write(audio_data)
+
+            logger.info("Kokoro TTS complete: %s (%s bytes, format: %s)",
+                       output_path, len(audio_data), output_format)
+            return output_path
+
+    except Exception as e:
+        raise RuntimeError(f"Kokoro synthesis failed: {e}")
+
+
 # ===========================================================================
 # Main tool function
 # ===========================================================================
@@ -443,6 +520,16 @@ def text_to_speech_tool(
                 }, ensure_ascii=False)
             logger.info("Generating speech with NeuTTS (local)...")
             _generate_neutts(text, file_str, tts_config)
+
+        elif provider == "kokoro":
+            if not _check_kokoro_available():
+                return json.dumps({
+                    "success": False,
+                    "error": "Kokoro provider selected but Kokoro service is unavailable. "
+                             "Ensure Kokoro is running at the configured endpoint."
+                }, ensure_ascii=False)
+            logger.info("Generating speech with Kokoro...")
+            _generate_kokoro(text, file_str, tts_config)
 
         else:
             # Default: Edge TTS (free), with NeuTTS as local fallback
@@ -557,6 +644,8 @@ def check_tts_requirements() -> bool:
     except ImportError:
         pass
     if _check_neutts_available():
+        return True
+    if _check_kokoro_available():
         return True
     return False
 
