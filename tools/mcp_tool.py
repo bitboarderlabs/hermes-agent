@@ -792,7 +792,7 @@ class MCPServerTask:
         After the initial ``await`` (list_tools), all mutations are synchronous
         — atomic from the event loop's perspective.
         """
-        from tools.registry import registry
+        from tools.registry import registry, tool_error
         from toolsets import TOOLSETS
 
         async with self._refresh_lock:
@@ -833,6 +833,15 @@ class MCPServerTask:
 
         safe_env = _build_safe_env(user_env)
         command, safe_env = _resolve_stdio_command(command, safe_env)
+
+        # Check package against OSV malware database before spawning
+        from tools.osv_check import check_package_for_malware
+        malware_error = check_package_for_malware(command, args)
+        if malware_error:
+            raise ValueError(
+                f"MCP server '{self.name}': {malware_error}"
+            )
+
         server_params = StdioServerParameters(
             command=command,
             args=args,
@@ -842,13 +851,25 @@ class MCPServerTask:
         sampling_kwargs = self._sampling.session_kwargs() if self._sampling else {}
         if _MCP_NOTIFICATION_TYPES and _MCP_MESSAGE_HANDLER_SUPPORTED:
             sampling_kwargs["message_handler"] = self._make_message_handler()
+
+        # Snapshot child PIDs before spawning so we can track the new one.
+        pids_before = _snapshot_child_pids()
         async with stdio_client(server_params) as (read_stream, write_stream):
+            # Capture the newly spawned subprocess PID for force-kill cleanup.
+            new_pids = _snapshot_child_pids() - pids_before
+            if new_pids:
+                with _lock:
+                    _stdio_pids.update(new_pids)
             async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
                 await session.initialize()
                 self.session = session
                 await self._discover_tools()
                 self._ready.set()
                 await self._shutdown_event.wait()
+        # Context exited cleanly — subprocess was terminated by the SDK.
+        if new_pids:
+            with _lock:
+                _stdio_pids.difference_update(new_pids)
 
     async def _run_http(self, config: dict):
         """Run the server using HTTP/StreamableHTTP transport."""
@@ -863,14 +884,20 @@ class MCPServerTask:
         headers = dict(config.get("headers") or {})
         connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
 
-        # OAuth 2.1 PKCE: build httpx.Auth handler using the MCP SDK
+        # OAuth 2.1 PKCE: build httpx.Auth handler using the MCP SDK.
+        # If OAuth setup fails (e.g. non-interactive environment without
+        # cached tokens), re-raise so this server is reported as failed
+        # without blocking other MCP servers from connecting.
         _oauth_auth = None
         if self._auth_type == "oauth":
             try:
                 from tools.mcp_oauth import build_oauth_auth
-                _oauth_auth = build_oauth_auth(self.name, url)
+                _oauth_auth = build_oauth_auth(
+                    self.name, url, config.get("oauth")
+                )
             except Exception as exc:
                 logger.warning("MCP OAuth setup failed for '%s': %s", self.name, exc)
+                raise
 
         sampling_kwargs = self._sampling.session_kwargs() if self._sampling else {}
         if _MCP_NOTIFICATION_TYPES and _MCP_MESSAGE_HANDLER_SUPPORTED:
@@ -1044,8 +1071,55 @@ _servers: Dict[str, MCPServerTask] = {}
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
 _mcp_thread: Optional[threading.Thread] = None
 
-# Protects _mcp_loop, _mcp_thread, and _servers from concurrent access.
+# Protects _mcp_loop, _mcp_thread, _servers, and _stdio_pids.
 _lock = threading.Lock()
+
+# PIDs of stdio MCP server subprocesses.  Tracked so we can force-kill
+# them on shutdown if the graceful cleanup (SDK context-manager teardown)
+# fails or times out.  PIDs are added after connection and removed on
+# normal server shutdown.
+_stdio_pids: set = set()
+
+
+def _snapshot_child_pids() -> set:
+    """Return a set of current child process PIDs.
+
+    Uses /proc on Linux, falls back to psutil, then empty set.
+    Used by _run_stdio to identify the subprocess spawned by stdio_client.
+    """
+    my_pid = os.getpid()
+
+    # Linux: read from /proc
+    try:
+        children_path = f"/proc/{my_pid}/task/{my_pid}/children"
+        with open(children_path) as f:
+            return {int(p) for p in f.read().split() if p.strip()}
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+
+    # Fallback: psutil
+    try:
+        import psutil
+        return {c.pid for c in psutil.Process(my_pid).children()}
+    except Exception:
+        pass
+
+    return set()
+
+
+def _mcp_loop_exception_handler(loop, context):
+    """Suppress benign 'Event loop is closed' noise during shutdown.
+
+    When the MCP event loop is stopped and closed, httpx/httpcore async
+    transports may fire __del__ finalizers that call call_soon() on the
+    dead loop.  asyncio catches that RuntimeError and routes it here.
+    We silence it because the connection is being torn down anyway; all
+    other exceptions are forwarded to the default handler.
+    """
+    exc = context.get("exception")
+    if isinstance(exc, RuntimeError) and "Event loop is closed" in str(exc):
+        return  # benign shutdown race — suppress
+    loop.default_exception_handler(context)
 
 
 def _ensure_mcp_loop():
@@ -1055,6 +1129,7 @@ def _ensure_mcp_loop():
         if _mcp_loop is not None and _mcp_loop.is_running():
             return
         _mcp_loop = asyncio.new_event_loop()
+        _mcp_loop.set_exception_handler(_mcp_loop_exception_handler)
         _mcp_thread = threading.Thread(
             target=_mcp_loop.run_forever,
             name="mcp-event-loop",
@@ -1178,7 +1253,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             for block in (result.content or []):
                 if hasattr(block, "text"):
                     parts.append(block.text)
-            return json.dumps({"result": "\n".join(parts) if parts else ""})
+            text_result = "\n".join(parts) if parts else ""
+
+            # Prefer structuredContent (machine-readable JSON) over plain text
+            structured = getattr(result, "structuredContent", None)
+            if structured is not None:
+                return json.dumps({"result": structured})
+            return json.dumps({"result": text_result})
 
         try:
             return _run_on_mcp_loop(_call(), timeout=tool_timeout)
@@ -1242,6 +1323,8 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that reads a resource by URI from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
+        from tools.registry import tool_error
+
         with _lock:
             server = _servers.get(server_name)
         if not server or not server.session:
@@ -1251,7 +1334,7 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
 
         uri = args.get("uri")
         if not uri:
-            return json.dumps({"error": "Missing required parameter 'uri'"})
+            return tool_error("Missing required parameter 'uri'")
 
         async def _call():
             result = await server.session.read_resource(uri)
@@ -1331,6 +1414,8 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that gets a prompt by name from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
+        from tools.registry import tool_error
+
         with _lock:
             server = _servers.get(server_name)
         if not server or not server.session:
@@ -1340,7 +1425,7 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
 
         name = args.get("name")
         if not name:
-            return json.dumps({"error": "Missing required parameter 'name'"})
+            return tool_error("Missing required parameter 'name'")
         arguments = args.get("arguments", {})
 
         async def _call():
@@ -1649,7 +1734,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     Returns:
         List of registered prefixed tool names.
     """
-    from tools.registry import registry
+    from tools.registry import registry, tool_error
     from toolsets import create_custom_toolset, TOOLSETS
 
     registered_names: List[str] = []
@@ -2057,6 +2142,29 @@ def shutdown_mcp_servers():
     _stop_mcp_loop()
 
 
+def _kill_orphaned_mcp_children() -> None:
+    """Best-effort kill of MCP stdio subprocesses that survived loop shutdown.
+
+    After the MCP event loop is stopped, stdio server subprocesses *should*
+    have been terminated by the SDK's context-manager cleanup.  If the loop
+    was stuck or the shutdown timed out, orphaned children may remain.
+
+    Only kills PIDs tracked in ``_stdio_pids`` — never arbitrary children.
+    """
+    import signal as _signal
+
+    with _lock:
+        pids = list(_stdio_pids)
+        _stdio_pids.clear()
+
+    for pid in pids:
+        try:
+            os.kill(pid, _signal.SIGKILL)
+            logger.debug("Force-killed orphaned MCP stdio process %d", pid)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass  # Already exited or inaccessible
+
+
 def _stop_mcp_loop():
     """Stop the background event loop and join its thread."""
     global _mcp_loop, _mcp_thread
@@ -2069,4 +2177,10 @@ def _stop_mcp_loop():
         loop.call_soon_threadsafe(loop.stop)
         if thread is not None:
             thread.join(timeout=5)
-        loop.close()
+        try:
+            loop.close()
+        except Exception:
+            pass
+        # After closing the loop, any stdio subprocesses that survived the
+        # graceful shutdown are now orphaned.  Force-kill them.
+        _kill_orphaned_mcp_children()
