@@ -13,9 +13,13 @@ This guide walks you through installing Hermes Agent, setting up a provider, and
 Run the one-line installer:
 
 ```bash
-# Linux / macOS / WSL2
+# Linux / macOS / WSL2 / Android (Termux)
 curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
 ```
+
+:::tip Android / Termux
+If you're installing on a phone, see the dedicated [Termux guide](./termux.md) for the tested manual path, supported extras, and current Android-specific limitations.
+:::
 
 :::tip Windows Users
 Install [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) first, then run the command above inside your WSL2 terminal.
@@ -47,6 +51,11 @@ hermes setup       # Or configure everything at once
 | **OpenRouter** | Multi-provider routing across many models | Enter your API key |
 | **Z.AI** | GLM / Zhipu-hosted models | Set `GLM_API_KEY` / `ZAI_API_KEY` |
 | **Kimi / Moonshot** | Moonshot-hosted coding and chat models | Set `KIMI_API_KEY` |
+| **Kimi / Moonshot China** | China-region Moonshot endpoint | Set `KIMI_CN_API_KEY` |
+| **Arcee AI** | Trinity models | Set `ARCEEAI_API_KEY` |
+| **Xiaomi MiMo** | Xiaomi MiMo models via [platform.xiaomimimo.com](https://platform.xiaomimimo.com) | Set `XIAOMI_API_KEY` |
+| **AWS Bedrock** | Anthropic Claude, Amazon Nova, DeepSeek v3.2, and Meta Llama via AWS | Standard boto3 auth (`AWS_PROFILE` or `AWS_ACCESS_KEY_ID` + `AWS_REGION`) |
+| **Qwen Portal (OAuth)** | Qwen 3.5 / Qwen-Coder models via Alibaba's consumer Qwen Portal | OAuth via `hermes model` (optional: `HERMES_QWEN_BASE_URL`) |
 | **MiniMax** | International MiniMax endpoint | Set `MINIMAX_API_KEY` |
 | **MiniMax China** | China-region MiniMax endpoint | Set `MINIMAX_CN_API_KEY` |
 | **Alibaba Cloud** | Qwen models via DashScope | Set `DASHSCOPE_API_KEY` |
@@ -55,10 +64,18 @@ hermes setup       # Or configure everything at once
 | **OpenCode Zen** | Pay-as-you-go access to curated models | Set `OPENCODE_ZEN_API_KEY` |
 | **OpenCode Go** | $10/month subscription for open models | Set `OPENCODE_GO_API_KEY` |
 | **DeepSeek** | Direct DeepSeek API access | Set `DEEPSEEK_API_KEY` |
+| **NVIDIA NIM** | Nemotron models via build.nvidia.com or local NIM | Set `NVIDIA_API_KEY` (optional: `NVIDIA_BASE_URL`) |
+| **Ollama Cloud** | Managed Ollama catalog without local GPU | Set `OLLAMA_API_KEY` (or pick **Ollama Cloud** in `hermes model`) |
+| **Google Gemini (OAuth)** | Gemini via Cloud Code Assist — free and paid tiers | OAuth via `hermes model` (optional: `HERMES_GEMINI_PROJECT_ID` for paid tiers) |
+| **xAI (Grok)** | Grok 4 models via Responses API + prompt caching | Set `XAI_API_KEY` (alias: `grok`) |
 | **GitHub Copilot** | GitHub Copilot subscription (GPT-5.x, Claude, Gemini, etc.) | OAuth via `hermes model`, or `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` |
 | **GitHub Copilot ACP** | Copilot ACP agent backend (spawns local `copilot` CLI) | `hermes model` (requires `copilot` CLI + `copilot login`) |
 | **Vercel AI Gateway** | Vercel AI Gateway routing | Set `AI_GATEWAY_API_KEY` |
 | **Custom Endpoint** | VLLM, SGLang, Ollama, or any OpenAI-compatible API | Set base URL + API key |
+
+:::caution Minimum context: 64K tokens
+Hermes Agent requires a model with at least **64,000 tokens** of context. Models with smaller windows cannot maintain enough working memory for multi-step tool-calling workflows and will be rejected at startup. Most hosted models (Claude, GPT, Gemini, Qwen, DeepSeek) meet this easily. If you're running a local model, set its context size to at least 64K (e.g. `--ctx-size 65536` for llama.cpp or `-c 65536` for Ollama).
+:::
 
 :::tip
 You can switch providers at any time with `hermes model` — no code changes, no lock-in. When configuring a custom endpoint, Hermes will prompt for the context window size and auto-detect it when possible. See [Context Length Detection](../integrations/providers.md#context-length-detection) for details.
@@ -67,10 +84,15 @@ You can switch providers at any time with `hermes model` — no code changes, no
 ## 3. Start Chatting
 
 ```bash
-hermes
+hermes            # classic CLI
+hermes --tui      # modern TUI (recommended)
 ```
 
 That's it! You'll see a welcome banner with your model, available tools, and skills. Type a message and press Enter.
+
+:::tip Pick your interface
+Hermes ships with two terminal interfaces: the classic `prompt_toolkit` CLI and a newer [TUI](../user-guide/tui.md) with modal overlays, mouse selection, and non-blocking input. Both share the same sessions, slash commands, and config — try each with `hermes` vs `hermes --tui`.
+:::
 
 ```
 ❯ What can you help me with?
@@ -144,9 +166,7 @@ Want microphone input in the CLI or spoken replies in messaging?
 
 ```bash
 pip install "hermes-agent[voice]"
-
-# Optional but recommended for free local speech-to-text
-pip install faster-whisper
+# Includes faster-whisper for free local speech-to-text
 ```
 
 Then start Hermes and enable it inside the CLI:

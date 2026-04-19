@@ -23,6 +23,58 @@ from tools.interrupt import is_interrupted
 
 logger = logging.getLogger(__name__)
 
+# Opt-in debug tracing for the interrupt/activity/poll machinery.  Set
+# HERMES_DEBUG_INTERRUPT=1 to log loop entry/exit, periodic heartbeats, and
+# every is_interrupted() state change from _wait_for_process.  Off by default
+# to avoid flooding production gateway logs.
+_DEBUG_INTERRUPT = bool(os.getenv("HERMES_DEBUG_INTERRUPT"))
+
+if _DEBUG_INTERRUPT:
+    # AIAgent's quiet_mode path (run_agent.py) forces the `tools` logger to
+    # ERROR on CLI startup, which would silently swallow every trace we emit.
+    # Force this module's own logger back to INFO so the trace is visible in
+    # agent.log regardless of quiet-mode.  Scoped to the opt-in case only.
+    logger.setLevel(logging.INFO)
+
+# Thread-local activity callback.  The agent sets this before a tool call so
+# long-running _wait_for_process loops can report liveness to the gateway.
+_activity_callback_local = threading.local()
+
+
+def set_activity_callback(cb: Callable[[str], None] | None) -> None:
+    """Register a callback that _wait_for_process fires periodically."""
+    _activity_callback_local.callback = cb
+
+
+def _get_activity_callback() -> Callable[[str], None] | None:
+    return getattr(_activity_callback_local, "callback", None)
+
+
+def touch_activity_if_due(
+    state: dict,
+    label: str,
+) -> None:
+    """Fire the activity callback at most once every ``state['interval']`` seconds.
+
+    *state* must contain ``last_touch`` (monotonic timestamp) and ``start``
+    (monotonic timestamp of the operation start).  An optional ``interval``
+    key overrides the default 10 s cadence.
+
+    Swallows all exceptions so callers don't need their own try/except.
+    """
+    now = time.monotonic()
+    interval = state.get("interval", 10.0)
+    if now - state["last_touch"] < interval:
+        return
+    state["last_touch"] = now
+    try:
+        cb = _get_activity_callback()
+        if cb:
+            elapsed = int(now - state["start"])
+            cb(f"{label} ({elapsed}s elapsed)")
+    except Exception:
+        pass
+
 
 def get_sandbox_dir() -> Path:
     """Return the host-side root for all sandbox storage (Docker workspaces,
@@ -42,8 +94,6 @@ def get_sandbox_dir() -> Path:
 # ---------------------------------------------------------------------------
 # Shared constants and utilities
 # ---------------------------------------------------------------------------
-
-_SYNC_INTERVAL_SECONDS = 5.0
 
 
 def _pipe_stdin(proc: subprocess.Popen, data: str) -> None:
@@ -226,19 +276,26 @@ class BaseEnvironment(ABC):
     # Snapshot creation timeout (override for slow cold-starts).
     _snapshot_timeout: int = 30
 
+    def get_temp_dir(self) -> str:
+        """Return the backend temp directory used for session artifacts.
+
+        Most sandboxed backends use ``/tmp`` inside the target environment.
+        LocalEnvironment overrides this on platforms like Termux where ``/tmp``
+        may be missing and ``TMPDIR`` is the portable writable location.
+        """
+        return "/tmp"
+
     def __init__(self, cwd: str, timeout: int, env: dict = None):
         self.cwd = cwd
         self.timeout = timeout
         self.env = env or {}
 
         self._session_id = uuid.uuid4().hex[:12]
-        self._snapshot_path = f"/tmp/hermes-snap-{self._session_id}.sh"
-        self._cwd_file = f"/tmp/hermes-cwd-{self._session_id}.txt"
+        temp_dir = self.get_temp_dir().rstrip("/") or "/"
+        self._snapshot_path = f"{temp_dir}/hermes-snap-{self._session_id}.sh"
+        self._cwd_file = f"{temp_dir}/hermes-cwd-{self._session_id}.txt"
         self._cwd_marker = _cwd_marker(self._session_id)
         self._snapshot_ready = False
-        self._last_sync_time: float | None = (
-            None  # set to 0 by backends that need file sync
-        )
 
     # ------------------------------------------------------------------
     # Abstract methods
@@ -365,6 +422,17 @@ class BaseEnvironment(ABC):
         """Poll-based wait with interrupt checking and stdout draining.
 
         Shared across all backends — not overridden.
+
+        Fires the ``activity_callback`` (if set on this instance) every 10s
+        while the process is running so the gateway's inactivity timeout
+        doesn't kill long-running commands.
+
+        Also wraps the poll loop in a ``try/finally`` that guarantees we
+        call ``self._kill_process(proc)`` if we exit via ``KeyboardInterrupt``
+        or ``SystemExit``.  Without this, the local backend (which spawns
+        subprocesses with ``os.setsid`` into their own process group) leaves
+        an orphan with ``PPID=1`` when python is shut down mid-tool — the
+        ``sleep 300``-survives-30-min bug Physikal and I both hit.
         """
         output_chunks: list[str] = []
 
@@ -383,27 +451,107 @@ class BaseEnvironment(ABC):
         drain_thread = threading.Thread(target=_drain, daemon=True)
         drain_thread.start()
         deadline = time.monotonic() + timeout
+        _now = time.monotonic()
+        _activity_state = {
+            "last_touch": _now,
+            "start": _now,
+        }
 
-        while proc.poll() is None:
-            if is_interrupted():
+        # --- Debug tracing (opt-in via HERMES_DEBUG_INTERRUPT=1) -------------
+        # Captures loop entry/exit, interrupt state changes, and periodic
+        # heartbeats so we can diagnose "agent never sees the interrupt"
+        # reports without reproducing locally.
+        _tid = threading.current_thread().ident
+        _pid = getattr(proc, "pid", None)
+        _iter_count = 0
+        _last_heartbeat = _now
+        _last_interrupt_state = False
+        _cb_was_none = _get_activity_callback() is None
+        if _DEBUG_INTERRUPT:
+            logger.info(
+                "[interrupt-debug] _wait_for_process ENTER tid=%s pid=%s "
+                "timeout=%ss activity_cb=%s initial_interrupt=%s",
+                _tid, _pid, timeout,
+                "set" if not _cb_was_none else "MISSING",
+                is_interrupted(),
+            )
+
+        try:
+            while proc.poll() is None:
+                _iter_count += 1
+                if is_interrupted():
+                    if _DEBUG_INTERRUPT:
+                        logger.info(
+                            "[interrupt-debug] _wait_for_process INTERRUPT DETECTED "
+                            "tid=%s pid=%s iter=%d elapsed=%.1fs — killing process group",
+                            _tid, _pid, _iter_count, time.monotonic() - _activity_state["start"],
+                        )
+                    self._kill_process(proc)
+                    drain_thread.join(timeout=2)
+                    return {
+                        "output": "".join(output_chunks) + "\n[Command interrupted]",
+                        "returncode": 130,
+                    }
+                if time.monotonic() > deadline:
+                    if _DEBUG_INTERRUPT:
+                        logger.info(
+                            "[interrupt-debug] _wait_for_process TIMEOUT "
+                            "tid=%s pid=%s iter=%d timeout=%ss",
+                            _tid, _pid, _iter_count, timeout,
+                        )
+                    self._kill_process(proc)
+                    drain_thread.join(timeout=2)
+                    partial = "".join(output_chunks)
+                    timeout_msg = f"\n[Command timed out after {timeout}s]"
+                    return {
+                        "output": partial + timeout_msg
+                        if partial
+                        else timeout_msg.lstrip(),
+                        "returncode": 124,
+                    }
+                # Periodic activity touch so the gateway knows we're alive
+                touch_activity_if_due(_activity_state, "terminal command running")
+
+                # Heartbeat every ~30s: proves the loop is alive and reports
+                # the activity-callback state (thread-local, can get clobbered
+                # by nested tool calls or executor thread reuse).
+                if _DEBUG_INTERRUPT and time.monotonic() - _last_heartbeat >= 30.0:
+                    _cb_now_none = _get_activity_callback() is None
+                    logger.info(
+                        "[interrupt-debug] _wait_for_process HEARTBEAT "
+                        "tid=%s pid=%s iter=%d elapsed=%.0fs "
+                        "interrupt=%s activity_cb=%s%s",
+                        _tid, _pid, _iter_count,
+                        time.monotonic() - _activity_state["start"],
+                        is_interrupted(),
+                        "set" if not _cb_now_none else "MISSING",
+                        " (LOST during run)" if _cb_now_none and not _cb_was_none else "",
+                    )
+                    _last_heartbeat = time.monotonic()
+                    _cb_was_none = _cb_now_none
+
+                time.sleep(0.2)
+        except (KeyboardInterrupt, SystemExit):
+            # Signal arrived (SIGTERM/SIGHUP/SIGINT) or sys.exit() was called
+            # while we were polling.  The local backend spawns subprocesses
+            # with os.setsid, which puts them in their own process group — so
+            # if we let the interrupt propagate without killing the child,
+            # python exits and the child is reparented to init (PPID=1) and
+            # keeps running as an orphan.  Killing the process group here
+            # guarantees the tool's side effects stop when the agent stops.
+            if _DEBUG_INTERRUPT:
+                logger.info(
+                    "[interrupt-debug] _wait_for_process EXCEPTION_EXIT "
+                    "tid=%s pid=%s iter=%d elapsed=%.1fs — killing subprocess group before re-raise",
+                    _tid, _pid, _iter_count,
+                    time.monotonic() - _activity_state["start"],
+                )
+            try:
                 self._kill_process(proc)
                 drain_thread.join(timeout=2)
-                return {
-                    "output": "".join(output_chunks) + "\n[Command interrupted]",
-                    "returncode": 130,
-                }
-            if time.monotonic() > deadline:
-                self._kill_process(proc)
-                drain_thread.join(timeout=2)
-                partial = "".join(output_chunks)
-                timeout_msg = f"\n[Command timed out after {timeout}s]"
-                return {
-                    "output": partial + timeout_msg
-                    if partial
-                    else timeout_msg.lstrip(),
-                    "returncode": 124,
-                }
-            time.sleep(0.2)
+            except Exception:
+                pass  # cleanup is best-effort
+            raise
 
         drain_thread.join(timeout=5)
 
@@ -411,6 +559,15 @@ class BaseEnvironment(ABC):
             proc.stdout.close()
         except Exception:
             pass
+
+        if _DEBUG_INTERRUPT:
+            logger.info(
+                "[interrupt-debug] _wait_for_process EXIT (natural) "
+                "tid=%s pid=%s iter=%d elapsed=%.1fs returncode=%s",
+                _tid, _pid, _iter_count,
+                time.monotonic() - _activity_state["start"],
+                proc.returncode,
+            )
 
         return {"output": "".join(output_chunks), "returncode": proc.returncode}
 
@@ -467,22 +624,14 @@ class BaseEnvironment(ABC):
     # Hooks
     # ------------------------------------------------------------------
 
-    def _before_execute(self):
-        """Rate-limited file sync before each command.
+    def _before_execute(self) -> None:
+        """Hook called before each command execution.
 
-        Backends that need pre-command sync set ``self._last_sync_time = 0``
-        in ``__init__`` and override :meth:`_sync_files`.  Backends needing
-        extra pre-exec logic (e.g. Daytona sandbox restart check) override
-        this method and call ``super()._before_execute()``.
+        Remote backends (SSH, Modal, Daytona) override this to trigger
+        their FileSyncManager.  Bind-mount backends (Docker, Singularity)
+        and Local don't need file sync — the host filesystem is directly
+        visible inside the container/process.
         """
-        if self._last_sync_time is not None:
-            now = time.monotonic()
-            if now - self._last_sync_time >= _SYNC_INTERVAL_SECONDS:
-                self._sync_files()
-                self._last_sync_time = now
-
-    def _sync_files(self):
-        """Push files to remote environment. Called rate-limited by _before_execute."""
         pass
 
     # ------------------------------------------------------------------
@@ -550,9 +699,3 @@ class BaseEnvironment(ABC):
 
         return _transform_sudo_command(command)
 
-    def _timeout_result(self, timeout: int | None) -> dict:
-        """Standard return dict when a command times out."""
-        return {
-            "output": f"Command timed out after {timeout or self.timeout}s",
-            "returncode": 124,
-        }
