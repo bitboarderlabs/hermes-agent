@@ -928,7 +928,7 @@ class MCPServerTask:
                         self.session = session
                         await self._discover_tools()
                         self._ready.set()
-                        await self._shutdown_event.wait()
+                        await self._wait_with_health_check(session)
         else:
             # Deprecated API (mcp < 1.24.0): manages httpx client internally.
             _http_kwargs: dict = {
@@ -945,7 +945,7 @@ class MCPServerTask:
                     self.session = session
                     await self._discover_tools()
                     self._ready.set()
-                    await self._shutdown_event.wait()
+                    await self._wait_with_health_check(session)
 
     async def _discover_tools(self):
         """Discover tools from the connected session."""
@@ -957,6 +957,46 @@ class MCPServerTask:
             if hasattr(tools_result, "tools")
             else []
         )
+
+    async def _wait_with_health_check(self, session):
+        """Wait for shutdown, but periodically ping to detect dead sessions.
+
+        If the MCP server ping fails consecutively, raises ConnectionError
+        to trigger reconnection via the run() loop.
+        """
+        _PING_INTERVAL = 30   # seconds between health pings
+        _PING_TIMEOUT = 10    # seconds to wait for ping response
+        _MAX_FAILURES = 2     # consecutive failures before reconnecting
+        consecutive_failures = 0
+
+        while not self._shutdown_event.is_set():
+            # Sleep for the ping interval, but wake early on shutdown
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(),
+                    timeout=_PING_INTERVAL,
+                )
+                return  # Shutdown was requested -- exit cleanly
+            except asyncio.TimeoutError:
+                pass  # Interval elapsed -- time to ping
+
+            try:
+                await asyncio.wait_for(
+                    session.send_ping(), timeout=_PING_TIMEOUT,
+                )
+                consecutive_failures = 0
+            except Exception as exc:
+                consecutive_failures += 1
+                logger.warning(
+                    "MCP server '%s' health ping failed (%d/%d): %s",
+                    self.name, consecutive_failures, _MAX_FAILURES,
+                    type(exc).__name__,
+                )
+                if consecutive_failures >= _MAX_FAILURES:
+                    raise ConnectionError(
+                        f"MCP server \'{self.name}\' session unhealthy "
+                        f"after {consecutive_failures} failed pings"
+                    ) from exc
 
     async def run(self, config: dict):
         """Long-lived coroutine: connect, discover tools, wait, disconnect.
@@ -1265,8 +1305,8 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             return _run_on_mcp_loop(_call(), timeout=tool_timeout)
         except Exception as exc:
             logger.error(
-                "MCP tool %s/%s call failed: %s",
-                server_name, tool_name, exc,
+                "MCP tool %s/%s call failed: %s: %s",
+                server_name, tool_name, type(exc).__name__, exc,
             )
             return json.dumps({
                 "error": _sanitize_error(
