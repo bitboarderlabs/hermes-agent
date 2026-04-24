@@ -61,18 +61,18 @@ Both `provider` and `model` are **required**. If either is missing, the fallback
 | Arcee AI | `arcee` | `ARCEEAI_API_KEY` |
 | Alibaba / DashScope | `alibaba` | `DASHSCOPE_API_KEY` |
 | Hugging Face | `huggingface` | `HF_TOKEN` |
-| Custom endpoint | `custom` | `base_url` + `api_key_env` (see below) |
+| Custom endpoint | `custom` | `base_url` + `key_env` (see below) |
 
 ### Custom Endpoint Fallback
 
-For a custom OpenAI-compatible endpoint, add `base_url` and optionally `api_key_env`:
+For a custom OpenAI-compatible endpoint, add `base_url` and optionally `key_env`:
 
 ```yaml
 fallback_model:
   provider: custom
   model: my-local-model
   base_url: http://localhost:8000/v1
-  api_key_env: MY_LOCAL_KEY          # env var name containing the API key
+  key_env: MY_LOCAL_KEY              # env var name containing the API key
 ```
 
 ### When Fallback Triggers
@@ -94,8 +94,8 @@ When triggered, Hermes:
 
 The switch is seamless — your conversation history, tool calls, and context are preserved. The agent continues from exactly where it left off, just using a different model.
 
-:::info One-Shot
-Fallback activates **at most once** per session. If the fallback provider also fails, normal error handling takes over (retries, then error message). This prevents cascading failover loops.
+:::info Per-Turn, Not Per-Session
+Fallback is **turn-scoped**: each new user message starts with the primary model restored. If the primary fails mid-turn, fallback activates for that turn only. On the next message, Hermes tries the primary again. Within a single turn, fallback activates at most once — if the fallback also fails, normal error handling takes over (retries, then error message). This prevents cascading failover loops within a turn while giving the primary model a fresh chance every turn.
 :::
 
 ### Examples
@@ -128,7 +128,7 @@ fallback_model:
   provider: custom
   model: llama-3.1-70b
   base_url: http://localhost:8000/v1
-  api_key_env: LOCAL_API_KEY
+  key_env: LOCAL_API_KEY
 ```
 
 **Codex OAuth as fallback:**
@@ -215,6 +215,9 @@ auxiliary:
   session_search:
     provider: "auto"
     model: ""
+    timeout: 30
+    max_concurrency: 3
+    extra_body: {}
 
   skills_hub:
     provider: "auto"
@@ -247,6 +250,25 @@ fallback_model:
   model: anthropic/claude-sonnet-4
   # base_url: http://localhost:8000/v1               # Optional custom endpoint
 ```
+
+For `auxiliary.session_search`, Hermes also supports:
+
+- `max_concurrency` to limit how many session summaries run at once
+- `extra_body` to pass provider-specific OpenAI-compatible request fields through on the summarization calls
+
+Example:
+
+```yaml
+auxiliary:
+  session_search:
+    provider: main
+    model: glm-4.5-air
+    max_concurrency: 2
+    extra_body:
+      enable_thinking: false
+```
+
+If your provider does not support a native OpenAI-compatible reasoning-control field, `extra_body` will not help for that part; in that case `max_concurrency` is still useful for reducing request-burst 429s.
 
 All three — auxiliary, compression, fallback — work the same way: set `provider` to pick who handles the request, `model` to pick which model, and `base_url` to point at a custom endpoint (overrides provider).
 
@@ -336,7 +358,7 @@ See [Scheduled Tasks (Cron)](/docs/user-guide/features/cron) for full configurat
 
 | Feature | Fallback Mechanism | Config Location |
 |---------|-------------------|----------------|
-| Main agent model | `fallback_model` in config.yaml — one-shot failover on errors | `fallback_model:` (top-level) |
+| Main agent model | `fallback_model` in config.yaml — per-turn failover on errors (primary restored each turn) | `fallback_model:` (top-level) |
 | Vision | Auto-detection chain + internal OpenRouter retry | `auxiliary.vision` |
 | Web extraction | Auto-detection chain + internal OpenRouter retry | `auxiliary.web_extract` |
 | Context compression | Auto-detection chain, degrades to no-summary if unavailable | `auxiliary.compression` |
