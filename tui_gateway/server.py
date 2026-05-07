@@ -113,6 +113,28 @@ try:
 except Exception:
     pass
 
+
+def _discover_mcp_at_startup() -> None:
+    try:
+        from hermes_cli.config import read_raw_config
+
+        raw = read_raw_config() or {}
+        servers = raw.get("mcp_servers")
+        has_servers = isinstance(servers, dict) and bool(servers)
+    except Exception:
+        has_servers = True
+    if not has_servers:
+        return
+    try:
+        from tools.mcp_tool import discover_mcp_tools
+
+        discover_mcp_tools()
+    except Exception as exc:
+        logger.warning("MCP tool discovery failed at TUI WS startup: %s", exc)
+
+
+_discover_mcp_at_startup()
+
 from tui_gateway.render import make_stream_renderer, render_diff, render_message
 
 _sessions: dict[str, dict] = {}
